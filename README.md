@@ -73,9 +73,89 @@ TOKEN_USE_OUT_DIR=./logs cargo run --release
 | `RUST_LOG` | `info` | operational log level (stderr) |
 
 ## Elasticsearch ingestion
-See [`deploy/filebeat-token-use.yml`](deploy/filebeat-token-use.yml) for a
-filestream input. Recommended: an ingest pipeline that sets `_id` to
-`claude.message_id` for call records, making re-ingestion idempotent.
+On Fleet-managed machines, an Elastic Agent custom-logs integration tails the
+NDJSON output and ships it. The records carry `event.dataset`
+(`claude_code.token_usage` / `claude_code.turn`) and `event.module: token-use`, and
+belong in per-dataset data streams `logs-<event.dataset>-<namespace>`.
+See [`deploy/filebeat-token-use.example.yml`](deploy/filebeat-token-use.example.yml)
+for the standalone shipper, which routes there directly (see
+[Data stream routing](#data-stream-routing)).
+
+### Un-Fleet-managed Macs: standalone Filebeat
+For Macs that **cannot be enrolled in Fleet**, `mac-filebeat-install.sh` ships the
+same logs to the same Elastic cluster with the **same NDJSON preprocessing**, using
+a self-contained Filebeat that lives in this project directory and is driven by a
+local yml.
+
+```bash
+./mac-filebeat-install.sh        # 1st run: downloads Filebeat, creates local config, stops
+#   edit ./filebeat-token-use.yml  (set the API key; host/routing pre-filled)
+./mac-filebeat-install.sh        # 2nd run: validates, registers launchd service
+./mac-filebeat-install.sh --uninstall   # stop + remove the service
+./mac-reprocess.sh               # reset the registry + re-ship every *.ndjson
+```
+
+Use `mac-reprocess.sh` after an ingest-pipeline / data-stream fix to re-ingest
+records that were already shipped (it clears the Filebeat registry so every line
+is re-read). It is the shipper-side counterpart to `reset.sh` (which re-backfills
+the collector). Because data-stream docs get an auto-assigned `_id`, a re-ship can
+duplicate records that were *already* ingested successfully — run it when the
+prior attempts failed (e.g. failure store) or you want a deliberate full re-ingest.
+
+What it does:
+- Downloads a pinned Filebeat (**9.4.2**, matching the Fleet agent and the 9.x
+  stack) into `./filebeat/` (gitignored).
+- Creates `./filebeat-token-use.yml` (gitignored, `chmod 0600`) from
+  [`deploy/filebeat-token-use.example.yml`](deploy/filebeat-token-use.example.yml).
+- Registers a **launchd agent** (`com.derickson.token-use-filebeat`, `RunAtLoad` +
+  `KeepAlive`) so Filebeat runs at boot without a login.
+
+The example is pre-filled from a Fleet-managed host's `elastic-agent inspect`:
+- same NDJSON parser (`target: ""`, `overwrite_keys`, `add_error_key`),
+- same Elastic Cloud `output.elasticsearch.hosts`,
+- direct routing to `logs-<event.dataset>-dericksontokenuse`
+  (see [Data stream routing](#data-stream-routing)).
+
+The **only** thing you supply is a **dedicated** API key (do *not* reuse the Fleet
+agent's key). In Kibana → *Stack Management → API keys*, create one whose role
+descriptor allows writing the token-use data streams, e.g.:
+
+```json
+{ "token-use-filebeat": {
+  "cluster": ["monitor"],
+  "indices": [ {
+    "names": ["logs-claude_code.*-dericksontokenuse"],
+    "privileges": ["auto_configure", "create_doc"] } ] } }
+```
+
+The `cluster: ["monitor"]` privilege is required: Filebeat calls `GET /` for a
+version check at startup (and `filebeat test output` does the same). Without it
+you get `403 ... action [cluster:monitor/main] is unauthorized`. The `indices`
+block alone is enough to *write* data but not to pass that check.
+
+Paste it into `filebeat-token-use.yml` in `id:key` form, then re-run
+`./mac-filebeat-install.sh`.
+
+### Data stream routing
+The shipper writes each record straight to its final data stream by
+`event.dataset` — `output.elasticsearch.index: "logs-%{[event.dataset]}-dericksontokenuse"`
+— so `claude_code.turn` → `logs-claude_code.turn-dericksontokenuse`, etc. These are
+auto-created by the stock `logs-*-*` template (permissive mappings), so
+`event.module: token-use` is accepted.
+
+This **bypasses** the `filestream.generic` data stream on purpose: that's the
+Custom Logs package stream, and its mapping pins `event.module` to the constant
+`filestream`, so any record written there with `event.module: token-use` is
+rejected (`document_parsing_exception`) and dead-letters into the
+`.fs-…` failure store. A Fleet *custom-logs* integration that writes to
+`filestream.generic` hits the same wall and needs either a `reroute` ingest
+pipeline (`{ "reroute": { "dataset": "{{{event.dataset}}}" } }`) or a dedicated
+dataset — the standalone shipper just routes correctly to begin with.
+
+> **No idempotent `_id`.** Data streams reject a client- or pipeline-set `_id`, so
+> re-ingestion is **not** deduped by `message.id`. Each line is shipped once
+> (collector checkpoint + Filebeat registry); duplicates only occur if the registry
+> is reset (e.g. `mac-reprocess.sh`) and the same lines are re-read.
 
 ## Development
 ```bash
@@ -94,6 +174,8 @@ src/
     claude_code.rs     Anthropic Claude Code collector
   daemon.rs            backfill + watch loop + tick
   config.rs main.rs error.rs
-deploy/                systemd unit, launchd plist, filebeat example
-install.sh             build + install the service (Linux/macOS)
+deploy/                systemd unit, launchd plists, standalone filebeat example
+install.sh             build + install the collector service (Linux/macOS)
+mac-filebeat-install.sh  standalone Filebeat shipper for un-Fleet-able Macs
+mac-reprocess.sh         reset the Filebeat registry + re-ship all NDJSON
 ```

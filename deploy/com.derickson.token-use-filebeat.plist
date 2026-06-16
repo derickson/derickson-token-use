@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.derickson.token-use-filebeat</string>
+
+    <!-- Run the in-repo Filebeat against the local config. Registry (path.data)
+         and Filebeat's own logs live OUTSIDE the repo so the checkout stays clean
+         and the read position survives across re-installs. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__FB_DIR__/filebeat</string>
+        <string>-e</string>
+        <string>-c</string>
+        <string>__REPO__/filebeat-token-use.yml</string>
+        <string>--path.home</string>
+        <string>__FB_DIR__</string>
+        <string>--path.config</string>
+        <string>__REPO__</string>
+        <string>--path.data</string>
+        <string>__HOME__/Library/Application Support/token-use/filebeat-data</string>
+        <string>--path.logs</string>
+        <string>__HOME__/Library/Logs</string>
+    </array>
+
+    <!-- Start at login and respawn if it exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Filebeat's own stdout/stderr (NOT the token-use NDJSON data). -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/token-use-filebeat.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/token-use-filebeat.err.log</string>
+</dict>
+</plist>

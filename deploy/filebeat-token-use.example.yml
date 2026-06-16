@@ -1,0 +1,62 @@
+# Standalone Filebeat config for token-use on Macs that CANNOT be enrolled in
+# Fleet. It reproduces EXACTLY what the Fleet "filestream / token-use" integration
+# does: same NDJSON parsing, same initial data stream, same ingest pipeline — so
+# documents land in the same place after the same server-side processing.
+#
+# This is the committed EXAMPLE. mac-filebeat-install.sh copies it to
+#   ./filebeat-token-use.yml        (gitignored, chmod 0600)
+# on first run. The only value you MUST fill in is the API key; the host /
+# data stream / pipeline below already match the Fleet integration.
+#
+# Values were taken from a Fleet-managed host's `elastic-agent inspect`:
+#   - filestream input "token-use": data_stream.namespace = dericksontokenuse,
+#     data_stream.dataset = filestream.generic, pipeline = token-use-id
+#   - ndjson parser: target "", overwrite_keys, add_error_key
+#   - output.elasticsearch.hosts (the Elastic Cloud deployment)
+
+filebeat.inputs:
+  - type: filestream
+    id: token-use
+    enabled: true
+    paths:
+      # macOS collector output (see deploy/com.derickson.token-use.plist):
+      - ${HOME}/Library/Application Support/token-use/logs/*.ndjson
+    parsers:
+      # Same NDJSON preprocessing as the Fleet integration: decode each line and
+      # promote its fields to the top level. (Matches the agent's parser exactly:
+      # no expand_keys.)
+      - ndjson:
+          target: ""            # promote parsed fields to the top level
+          overwrite_keys: true
+          add_error_key: true
+
+output.elasticsearch:
+  # Same Elastic Cloud deployment the Fleet agent ships to.
+  hosts: ["__ES_HOST__"]
+
+  # Dedicated, scoped API key in "id:key" form (NOT the base64 header form, and
+  # NOT the Fleet agent's key). See README for how to mint it.
+  api_key: "__ID__:__API_KEY__"
+
+  # Route each record straight to its FINAL data stream by event.dataset, e.g.
+  #   claude_code.turn        -> logs-claude_code.turn-dericksontokenuse
+  #   claude_code.token_usage -> logs-claude_code.token_usage-dericksontokenuse
+  # This bypasses the filestream.generic data stream entirely. (filestream.generic
+  # is the Custom Logs package stream; its mapping pins event.module to the
+  # constant "filestream" and rejects our event.module="token-use", which is why
+  # writing there dead-letters into the failure store.) The targets are
+  # auto-created by the stock logs-*-* template with permissive mappings.
+  #
+  # No ingest pipeline: data streams forbid a custom _id, so there is no
+  # idempotency key; dedup relies on the collector checkpoint + Filebeat registry.
+  index: "logs-%{[event.dataset]}-dericksontokenuse"
+
+# Standalone Filebeat must not manage templates/ILM for a Fleet-owned data stream.
+# (Mirrors how the managed agent runs filebeat: ilm + template setup disabled. A
+# custom `index` also requires ILM off.)
+setup.template.enabled: false
+setup.ilm.enabled: false
+
+# Operational log of Filebeat ITSELF (not the token-use data). The launchd plist
+# also redirects stdout/stderr to ~/Library/Logs/token-use-filebeat.{out,err}.log.
+logging.level: info

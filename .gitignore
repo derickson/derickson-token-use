@@ -1,3 +1,11 @@
 /target
 /logs
 *.ndjson
+
+# Standalone Filebeat (mac-filebeat-install.sh): downloaded binary + local config
+/filebeat/
+/filebeat-token-use.yml
+
+# Local Elastic Agent config dump used to derive the Filebeat config (has hosts,
+# signed policy blob); keep it out of git.
+/ea-inspect.yml
