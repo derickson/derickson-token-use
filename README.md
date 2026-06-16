@@ -44,6 +44,28 @@ Two ECS-friendly record types share one NDJSON stream, distinguished by
   ~5-minute tick rescans for missed events / new files and checkpoints state.
 
 ## Install (Linux & macOS)
+
+### Prerequisites: the Rust toolchain
+Building the collector needs `cargo`/`rustc` (Rust 2021, stable). The one-liner
+below works on both Linux and macOS; if `cargo` is already on your `PATH` you can
+skip it.
+
+```bash
+# Linux & macOS — official installer (installs rustup + the stable toolchain)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"      # add cargo to PATH for the current shell
+```
+
+Or use your package manager instead:
+- **macOS** — `brew install rustup-init && rustup-init` (or `brew install rust`).
+- **Linux (Debian/Ubuntu)** — `sudo apt install rustup && rustup default stable`
+  (older releases: `sudo apt install cargo`); **Fedora** — `sudo dnf install cargo`;
+  **Arch** — `sudo pacman -S rust`.
+
+Verify with `cargo --version`. On macOS the build also needs the Command Line
+Tools (`xcode-select --install`) for the system linker.
+
+### Build + register the service
 ```bash
 ./install.sh
 ```
@@ -61,6 +83,17 @@ Output NDJSON lands in:
 ```bash
 TOKEN_USE_OUT_DIR=./logs cargo run --release
 ```
+
+### Check it's running
+```bash
+./status.sh
+```
+`status.sh` auto-detects macOS vs Linux and reports the health of the whole
+pipeline: the collector daemon (process + launchd/systemd registration), the
+freshness of the output NDJSON, and which shipper — a Fleet-managed Elastic
+Agent and/or the standalone Filebeat below — is picking the logs up. It changes
+nothing and exits non-zero if the collector or all shippers are down (handy for
+`&&` chaining or monitoring).
 
 ## Configuration (environment)
 | Var | Default | Purpose |
@@ -176,6 +209,8 @@ src/
   config.rs main.rs error.rs
 deploy/                systemd unit, launchd plists, standalone filebeat example
 install.sh             build + install the collector service (Linux/macOS)
+status.sh              health check: collector + shipper (Linux/macOS)
+reset.sh               stop, wipe output + checkpoint, restart (full backfill)
 mac-filebeat-install.sh  standalone Filebeat shipper for un-Fleet-able Macs
 mac-reprocess.sh         reset the Filebeat registry + re-ship all NDJSON
 ```
