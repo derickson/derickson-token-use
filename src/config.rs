@@ -16,6 +16,8 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Home directory used to locate per-service transcript roots.
     pub home: PathBuf,
+    /// Root of the Hermes install (the SQLite poll source), normally `~/.hermes`.
+    pub hermes_dir: PathBuf,
     /// Debounce window for filesystem events.
     pub debounce: Duration,
     /// Safety-net tick: rescan known files, discover new ones, checkpoint state.
@@ -29,6 +31,7 @@ impl Config {
     ///   * `TOKEN_USE_OUT_DIR`   — output dir (default: `<cwd-of-project>/logs`)
     ///   * `TOKEN_USE_STATE_DIR` — state dir (default: XDG state / App Support)
     ///   * `TOKEN_USE_HOME`      — home override (default: `$HOME`)
+    ///   * `TOKEN_USE_HERMES_DIR` — Hermes install dir (default: `$HOME/.hermes`)
     ///   * `TOKEN_USE_DEBOUNCE_MS` (default 1500)
     ///   * `TOKEN_USE_TICK_SECS`   (default 300)
     pub fn from_env() -> Self {
@@ -36,6 +39,10 @@ impl Config {
             .map(PathBuf::from)
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."));
+
+        let hermes_dir = std::env::var_os("TOKEN_USE_HERMES_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".hermes"));
 
         // Default output dir: the project's own `logs/` directory. We anchor to
         // the binary's working directory so the service writes where it is run;
@@ -62,6 +69,7 @@ impl Config {
             out_dir,
             state_dir,
             home,
+            hermes_dir,
             debounce,
             tick,
         }

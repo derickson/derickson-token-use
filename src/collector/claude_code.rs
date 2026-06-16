@@ -132,6 +132,7 @@ impl ClaudeCodeCollector {
                 cache_creation_ephemeral_1h_input: u.cache_creation_1h,
                 total_input,
                 total: total_input + u.output,
+                reasoning: None,
             },
             perf: Perf {
                 generation_ms,

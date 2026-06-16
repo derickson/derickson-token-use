@@ -82,7 +82,7 @@ mod tests {
             tokens: Tokens {
                 input: 1, output: 2, cache_read_input: 0, cache_creation_input: 0,
                 cache_creation_ephemeral_5m_input: 0, cache_creation_ephemeral_1h_input: 0,
-                total_input: 1, total: 3,
+                total_input: 1, total: 3, reasoning: None,
             },
             perf: Perf { generation_ms: 0, tokens_per_sec: None },
             tools: Tools { use_count: 0, names: vec![] },

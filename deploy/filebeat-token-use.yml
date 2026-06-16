@@ -20,9 +20,13 @@ filebeat.inputs:
           # The record's own @timestamp is the event time.
           # (Filebeat maps a top-level @timestamp automatically.)
 
-# Idempotent ingestion: use the per-call message_id as the document _id so that a
-# re-read after an unclean restart updates rather than duplicates. Turn records
-# have no message_id; let Elasticsearch auto-assign their _id.
+# Idempotent ingestion: use a stable per-record key as the document _id so that a
+# re-read updates rather than duplicates.
+#   * Claude Code call records   -> _id = claude.message_id (immutable per API call).
+#   * Hermes token_usage records -> _id = hermes.session_id. These are re-emitted
+#     with the latest totals as a session grows, so keying by session_id makes each
+#     re-emit an in-place UPSERT (the doc reflects the session's current aggregate).
+#   * Turn records have no stable key; let Elasticsearch auto-assign their _id.
 #
 # Configure this in your output (example for the Elasticsearch output):
 #
@@ -30,12 +34,14 @@ filebeat.inputs:
 #   hosts: ["https://your-es:9200"]
 #   pipeline: token-use-id        # optional ingest pipeline below
 #
-# Optional ingest pipeline to set _id = claude.message_id for call records:
+# Optional ingest pipeline to set _id from the per-record key:
 #
 # PUT _ingest/pipeline/token-use-id
 # {
 #   "processors": [
 #     { "set": { "if": "ctx.event?.dataset == 'claude_code.token_usage'",
-#                "field": "_id", "value": "{{claude.message_id}}" } }
+#                "field": "_id", "value": "{{claude.message_id}}" } },
+#     { "set": { "if": "ctx.event?.dataset == 'hermes.token_usage'",
+#                "field": "_id", "value": "{{hermes.session_id}}" } }
 #   ]
 # }

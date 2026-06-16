@@ -19,6 +19,7 @@ use serde::Serialize;
 pub enum OutputRecord {
     Call(Box<CallRecord>),
     Turn(Box<TurnRecord>),
+    Hermes(Box<HermesRecord>),
 }
 
 impl OutputRecord {
@@ -27,6 +28,7 @@ impl OutputRecord {
         match self {
             OutputRecord::Call(c) => &c.date,
             OutputRecord::Turn(t) => &t.date,
+            OutputRecord::Hermes(h) => &h.date,
         }
     }
 
@@ -35,15 +37,20 @@ impl OutputRecord {
         match self {
             OutputRecord::Call(c) => c.service.name,
             OutputRecord::Turn(t) => t.service.name,
+            OutputRecord::Hermes(h) => h.service.name,
         }
     }
 
     /// Idempotency key for cross-restart dedup. Calls dedup on `message.id`;
-    /// turns have no stable key (offset checkpointing covers them).
+    /// turns have no stable key (offset checkpointing covers them). Hermes
+    /// records return `None` *by design*: a session is re-emitted as it grows,
+    /// so the in-process recent-id ring must not suppress legitimate updates —
+    /// the per-DB cursor already gates re-emits and ES upserts by `_id`.
     pub fn dedup_key(&self) -> Option<&str> {
         match self {
             OutputRecord::Call(c) => Some(&c.claude.message_id),
             OutputRecord::Turn(_) => None,
+            OutputRecord::Hermes(_) => None,
         }
     }
 }
@@ -121,6 +128,10 @@ pub struct Tokens {
     pub cache_creation_ephemeral_1h_input: u64,
     pub total_input: u64,
     pub total: u64,
+    /// Reasoning/"thinking" output tokens, when the provider reports them
+    /// separately (Hermes/OpenAI). Omitted for providers that don't (Claude Code).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<u64>,
 }
 
 /// Derived per-call inference throughput.
@@ -183,6 +194,69 @@ pub struct Turn {
     pub output_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_per_sec: Option<f64>,
+}
+
+// --- Hermes -----------------------------------------------------------------
+
+/// Per-session token-usage record for the Hermes agent
+/// (`event.dataset = "hermes.token_usage"`).
+///
+/// Hermes keeps its token breakdown per *session* (its `messages` table carries
+/// no usable per-message counts), so this is one record per session, re-emitted
+/// with the latest aggregate as the session grows. `provider` is dynamic here —
+/// it carries the session's `billing_provider` (e.g. `"openai-codex"`) — unlike
+/// the static `provider` on Claude Code records.
+#[derive(Debug, Clone, Serialize)]
+pub struct HermesRecord {
+    #[serde(skip)]
+    pub date: String,
+
+    #[serde(rename = "@timestamp")]
+    pub timestamp: String,
+    pub ingested_at: String,
+    pub event: Event,
+    pub service: Service,
+    pub provider: String,
+    pub model: String,
+    pub host: Host,
+    pub hermes: HermesMeta,
+    pub tokens: Tokens,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HermesMeta {
+    pub session_id: String,
+    /// `"default"` for `~/.hermes/state.db`, else the profile directory name.
+    pub persona: String,
+    /// `true` once the session has an `ended_at`.
+    pub ended: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_call_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<u64>,
+    /// `ended_at - started_at` in ms, when the session has ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
 }
 
 /// Compute tokens/sec from an output-token count and a duration in milliseconds,

@@ -13,7 +13,8 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use tracing::{debug, info, warn};
 
 use crate::collector::claude_code::ClaudeCodeCollector;
-use crate::collector::Collector;
+use crate::collector::hermes::HermesCollector;
+use crate::collector::{Collector, PollCollector};
 use crate::config::Config;
 use crate::output::OutputWriter;
 use crate::record::OutputRecord;
@@ -26,6 +27,9 @@ const IDLE_FLUSH: Duration = Duration::from_secs(30);
 pub struct Daemon {
     config: Config,
     collectors: Vec<Box<dyn Collector>>,
+    /// Poll-based sources (e.g. the Hermes SQLite collector), scanned at startup
+    /// and on each tick rather than driven by filesystem events.
+    poll_collectors: Vec<Box<dyn PollCollector>>,
     writers: HashMap<String, OutputWriter>,
     state: State,
 }
@@ -36,11 +40,20 @@ impl Daemon {
         info!(host = %host, "starting token-use daemon");
 
         let collectors: Vec<Box<dyn Collector>> =
-            vec![Box::new(ClaudeCodeCollector::new(&config.home, host))];
+            vec![Box::new(ClaudeCodeCollector::new(&config.home, host.clone()))];
+        let poll_collectors: Vec<Box<dyn PollCollector>> =
+            vec![Box::new(HermesCollector::new(&config.hermes_dir, host))];
 
         let mut writers = HashMap::new();
         for c in &collectors {
             info!(service = c.name(), provider = c.provider(), "collector registered");
+            writers.insert(
+                c.name().to_string(),
+                OutputWriter::new(config.out_dir.clone(), c.out_prefix()),
+            );
+        }
+        for c in &poll_collectors {
+            info!(service = c.name(), provider = c.provider(), "poll collector registered");
             writers.insert(
                 c.name().to_string(),
                 OutputWriter::new(config.out_dir.clone(), c.out_prefix()),
@@ -52,6 +65,7 @@ impl Daemon {
         Ok(Daemon {
             config,
             collectors,
+            poll_collectors,
             writers,
             state,
         })
@@ -72,9 +86,22 @@ impl Daemon {
                 files += 1;
             }
         }
+        self.poll_sources();
         self.state.save().context("saving state after backfill")?;
         info!(files, "backfill complete");
         Ok(())
+    }
+
+    /// Scan every poll-based source once and emit anything new. Each source uses
+    /// `self.state` as its durable cursor store, so this is idempotent across
+    /// restarts.
+    fn poll_sources(&mut self) {
+        for pi in 0..self.poll_collectors.len() {
+            let records = self.poll_collectors[pi].poll(&mut self.state);
+            for r in records {
+                self.emit(r);
+            }
+        }
     }
 
     fn watch_loop(&mut self) -> Result<()> {
@@ -156,6 +183,8 @@ impl Daemon {
                 self.emit(r);
             }
         }
+        // Poll SQLite/other non-tailed sources for new activity.
+        self.poll_sources();
         if let Err(e) = self.state.save_if_dirty() {
             warn!(error = %e, "failed to persist state on tick");
         }

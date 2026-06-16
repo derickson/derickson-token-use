@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 
 use crate::error::ParseError;
 use crate::record::OutputRecord;
+use crate::state::State;
 
 pub mod claude_code;
+pub mod hermes;
 
 pub trait Collector: Send {
     /// `service.name` for emitted records, e.g. `"claude-code"`.
@@ -52,4 +54,30 @@ pub trait Collector: Send {
     /// boundary line is delayed/absent is emitted, while a call still actively
     /// streaming is left open to avoid a premature, partial emit.
     fn flush_idle(&mut self, idle: std::time::Duration) -> Vec<OutputRecord>;
+}
+
+/// A *poll-based* source — the seam for collectors whose data lives somewhere
+/// the line-tailing [`Collector`] model doesn't fit (e.g. a SQLite database).
+///
+/// Instead of being fed lines, a `PollCollector` is asked to scan its sources on
+/// demand (at startup and on the daemon's periodic tick) and return any records
+/// produced since the last scan. It owns its own incrementality, using the
+/// shared [`State`] as a durable cursor store (the same per-path offset map the
+/// file tailer uses), so a poll is idempotent across restarts.
+pub trait PollCollector: Send {
+    /// `service.name` for emitted records, e.g. `"hermes"`.
+    fn name(&self) -> &'static str;
+
+    /// Default `provider` dimension for logging/registration. Individual records
+    /// may carry a more specific per-row provider.
+    fn provider(&self) -> &'static str;
+
+    /// Filename prefix for this service's daily output files.
+    fn out_prefix(&self) -> &'static str {
+        self.name()
+    }
+
+    /// Scan all sources and return records for anything changed since the last
+    /// poll, advancing the cursors held in `state`.
+    fn poll(&mut self, state: &mut State) -> Vec<OutputRecord>;
 }

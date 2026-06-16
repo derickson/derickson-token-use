@@ -23,6 +23,7 @@ tempfile = "3"
 walkdir = "2"
 crossbeam-channel = "0.5"
 dirs = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }   # bundled: compile SQLite in, no system libsqlite3
 
 [dev-dependencies]
 serde_json = "1"
