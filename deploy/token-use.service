@@ -1,0 +1,18 @@
+[Unit]
+Description=token-use: local AI token-usage collector (NDJSON for Elasticsearch)
+Documentation=https://github.com/derickson/token-use
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/token-use
+Restart=on-failure
+RestartSec=5
+# Where the NDJSON logs are written (Filebeat/filestream tails this dir).
+Environment=TOKEN_USE_OUT_DIR=%h/.local/share/token-use/logs
+# Durable checkpoint (per-file offsets + recent-id guard).
+Environment=TOKEN_USE_STATE_DIR=%h/.local/state/token-use
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

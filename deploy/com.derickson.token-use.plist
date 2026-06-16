@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.derickson.token-use</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/token-use</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TOKEN_USE_OUT_DIR</key>
+        <string>__HOME__/Library/Application Support/token-use/logs</string>
+        <key>TOKEN_USE_STATE_DIR</key>
+        <string>__HOME__/Library/Application Support/token-use/state</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <!-- Start at login and respawn if it exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- The daemon's own operational log (NOT the NDJSON output). -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/token-use.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/token-use.err.log</string>
+</dict>
+</plist>
