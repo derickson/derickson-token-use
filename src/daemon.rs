@@ -42,7 +42,7 @@ impl Daemon {
         let collectors: Vec<Box<dyn Collector>> =
             vec![Box::new(ClaudeCodeCollector::new(&config.home, host.clone()))];
         let poll_collectors: Vec<Box<dyn PollCollector>> =
-            vec![Box::new(HermesCollector::new(&config.hermes_dir, host))];
+            vec![Box::new(HermesCollector::new(&config.hermes_dir, host, config.hermes_idle))];
 
         let mut writers = HashMap::new();
         for c in &collectors {

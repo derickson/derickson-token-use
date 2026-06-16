@@ -32,6 +32,12 @@ pub struct State {
     pub files: HashMap<String, FileState>,
     #[serde(default)]
     pub recent_ids: Vec<String>,
+    /// Durable "already emitted" sets, keyed by an arbitrary namespace. Used by
+    /// poll collectors that dedupe locally and must guarantee a record is written
+    /// at most once *ever* (Hermes: namespace = DB path, ids = session ids). Unlike
+    /// `recent_ids` this is unbounded — it is the authoritative once-only ledger.
+    #[serde(default)]
+    pub marks: HashMap<String, HashSet<String>>,
 
     // Derived index over `recent_ids`, not serialized.
     #[serde(skip)]
@@ -60,6 +66,7 @@ impl State {
                 version: STATE_VERSION,
                 files: HashMap::new(),
                 recent_ids: Vec::new(),
+                marks: HashMap::new(),
                 recent_set: HashSet::new(),
                 recent_queue: VecDeque::new(),
                 path,
@@ -108,6 +115,18 @@ impl State {
                     self.recent_set.remove(&old);
                 }
             }
+            self.dirty = true;
+        }
+    }
+
+    /// Returns true if `id` was already emitted within namespace `ns`.
+    pub fn is_marked(&self, ns: &str, id: &str) -> bool {
+        self.marks.get(ns).is_some_and(|s| s.contains(id))
+    }
+
+    /// Record `id` as emitted within namespace `ns` (the once-only ledger).
+    pub fn mark(&mut self, ns: &str, id: &str) {
+        if self.marks.entry(ns.to_string()).or_default().insert(id.to_string()) {
             self.dirty = true;
         }
     }
@@ -166,6 +185,25 @@ mod tests {
         assert!(s2.seen_recent("msg_a"));
         assert!(s2.seen_recent("msg_b"));
         assert!(!s2.seen_recent("msg_c"));
+    }
+
+    #[test]
+    fn marks_round_trip_and_are_namespaced() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut s = State::load(dir.path()).unwrap();
+            s.mark("db_a", "sess_1");
+            s.mark("db_a", "sess_2");
+            s.mark("db_b", "sess_1");
+            s.save().unwrap();
+        }
+        let s2 = State::load(dir.path()).unwrap();
+        assert!(s2.is_marked("db_a", "sess_1"));
+        assert!(s2.is_marked("db_a", "sess_2"));
+        assert!(s2.is_marked("db_b", "sess_1"));
+        // Namespaced: db_b never marked sess_2.
+        assert!(!s2.is_marked("db_b", "sess_2"));
+        assert!(!s2.is_marked("db_c", "sess_1"));
     }
 
     #[test]

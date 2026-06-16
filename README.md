@@ -32,9 +32,14 @@ Hermes stores state in **SQLite** (`~/.hermes/state.db` plus one
 `~/.hermes/profiles/<name>/state.db` per **persona**), so it can't be byte-tailed
 like a text transcript — it's a **poll source** (see *How it works*). Its token
 breakdown only exists as a per-session aggregate, so the grain is **one record per
-session**, re-emitted with the latest totals as the session grows (key on
-`hermes.session_id` for an idempotent upsert). `hermes.persona` is `default` for
-the root DB or the profile directory name otherwise.
+session**, written **exactly once** when the session *settles* — its `ended_at` is
+set, or its newest message is older than `TOKEN_USE_HERMES_IDLE_SECS` (default
+600s). A durable per-session ledger guarantees the NDJSON stays **locally
+deduplicated** (one unique line per session, even across restarts) — required for
+a Fleet **data stream**, which assigns its own `_id` and cannot upsert. The cost
+of once-only is that a settled session which later resumes is not re-emitted;
+`ended_at` is the precise signal and always wins. `hermes.persona` is `default`
+for the root DB or the profile directory name otherwise.
 
 ### Derived-metric methodology
 - **Per-call** `generation_ms` = span between a response's first and last
@@ -59,12 +64,13 @@ There are two collector seams: a line-tailed **`Collector`** (Claude Code) and a
   count == distinct `message.id` count).
 
 **Hermes (poll):**
-- Each persona DB is opened **read-only**; the append-only `messages.id` is the
-  incremental **cursor** (stored in the same checkpoint as the file offsets).
-- A poll re-derives the snapshot only for sessions that gained a message since the
-  cursor, then advances the cursor to the new high-water mark — so a quiet poll
-  emits nothing (verified: emitted record count == distinct active sessions; a
-  re-run with no new activity adds zero lines).
+- Each persona DB is opened **read-only**; a poll scans sessions and emits each
+  **settled, not-yet-emitted** session exactly once, recording its id in a durable
+  **ledger** (`state.json` `marks`) so it is never written twice.
+- "Settled" = `ended_at` is set, or the newest message is older than the idle
+  window. A still-active session is left until it settles. The ledger — not a byte
+  cursor — is what guarantees once-only emission (verified: a settled session emits
+  once; growth, re-polls, and restarts add zero further lines).
 
 On first run it **backfills** all existing transcripts and Hermes sessions, then
 runs live. A ~5-minute tick rescans transcripts for missed events / new files,
@@ -96,6 +102,7 @@ TOKEN_USE_OUT_DIR=./logs cargo run --release
 | `TOKEN_USE_STATE_DIR` | XDG state / App Support | checkpoint (`state.json`) |
 | `TOKEN_USE_HOME` | `$HOME` | locate `~/.claude` (handy for testing) |
 | `TOKEN_USE_HERMES_DIR` | `$HOME/.hermes` | Hermes install dir (the SQLite poll source) |
+| `TOKEN_USE_HERMES_IDLE_SECS` | `600` | idle window before a Hermes session is finalized + emitted once |
 | `TOKEN_USE_DEBOUNCE_MS` | `1500` | FS-event debounce window |
 | `TOKEN_USE_TICK_SECS` | `300` | safety-net rescan / checkpoint interval |
 | `RUST_LOG` | `info` | operational log level (stderr) |

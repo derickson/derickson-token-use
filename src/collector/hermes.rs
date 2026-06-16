@@ -6,16 +6,25 @@
 //!
 //! Token usage lives in the `sessions` table as a per-session aggregate
 //! (`messages.token_count` is unpopulated), so we emit **one record per
-//! session**, re-emitted with the latest totals as the session grows. The
-//! `messages.id` autoincrement is the incremental cursor: a poll re-derives the
-//! snapshot only for sessions that gained a new message since the last cursor,
-//! then advances the cursor to the new high-water mark.
+//! session** — and **exactly once, ever**. A session is only written after it
+//! has *settled* (its `ended_at` is set, or its newest message is older than the
+//! idle window), and its id is then recorded in a durable "already emitted"
+//! ledger ([`State::mark`]) so it is never written again, even across restarts.
+//! This makes the NDJSON locally deduplicated: every line is a unique, final
+//! session — which is what a Fleet data stream needs, since those assign their
+//! own `_id` and cannot upsert.
+//!
+//! The cost of once-only is fidelity: if a settled session later resumes, its
+//! earlier snapshot is already committed and the delta is not re-emitted. The
+//! idle window (`TOKEN_USE_HERMES_IDLE_SECS`) trades latency against that risk;
+//! `ended_at` is the precise signal and always wins.
 //!
 //! "Personas" are profiles: `~/.hermes/state.db` is the `default` persona and
 //! each `~/.hermes/profiles/<name>/state.db` is persona `<name>`. (Backup copies
 //! under `state-snapshots/` are deliberately not enumerated.)
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
@@ -32,13 +41,16 @@ pub struct HermesCollector {
     /// Root of the Hermes install, normally `~/.hermes`.
     hermes_dir: PathBuf,
     host: String,
+    /// A session is finalized once it has been idle this long (unless ended).
+    idle: Duration,
 }
 
 impl HermesCollector {
-    pub fn new(hermes_dir: &Path, host: String) -> Self {
+    pub fn new(hermes_dir: &Path, host: String, idle: Duration) -> Self {
         HermesCollector {
             hermes_dir: hermes_dir.to_path_buf(),
             host,
+            idle,
         }
     }
 
@@ -72,50 +84,65 @@ impl HermesCollector {
         dbs
     }
 
-    /// Poll one persona DB: emit a fresh snapshot for every session touched by a
-    /// message newer than `cursor`, and report the new high-water `messages.id`.
-    fn poll_db(
+    /// Scan one persona DB and emit each **settled, not-yet-emitted** session
+    /// exactly once, marking it in the durable ledger (`ns` = the DB path).
+    ///
+    /// A session is settled when it has ended or its newest message is older than
+    /// the idle window. We scan all sessions every poll (cheap at these volumes);
+    /// the ledger — not a cursor — is what guarantees once-only emission.
+    fn scan_db(
         &self,
         db_path: &Path,
         persona: &str,
-        cursor: u64,
-    ) -> rusqlite::Result<(Vec<OutputRecord>, Option<u64>)> {
+        now: DateTime<Utc>,
+        ns: &str,
+        state: &mut State,
+    ) -> rusqlite::Result<Vec<OutputRecord>> {
         let conn = Connection::open_with_flags(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
 
-        // High-water mark over the append-only message id.
-        let max_id: Option<i64> =
-            conn.query_row("SELECT MAX(id) FROM messages", [], |r| r.get(0))?;
-        let Some(max_id) = max_id else {
-            return Ok((Vec::new(), None)); // no messages yet
-        };
-        let max_id = max_id.max(0) as u64;
-        if max_id <= cursor {
-            return Ok((Vec::new(), Some(max_id))); // nothing new
-        }
-
-        // Sessions that gained a message since the cursor.
-        let changed: Vec<String> = {
+        // (session_id, ended_at, latest message timestamp) for every active session.
+        let candidates: Vec<(String, Option<f64>, Option<f64>)> = {
             let mut stmt = conn.prepare(
-                "SELECT DISTINCT session_id FROM messages \
-                 WHERE id > ?1 AND session_id IS NOT NULL",
+                "SELECT s.id, s.ended_at, MAX(m.timestamp) \
+                 FROM sessions s JOIN messages m ON m.session_id = s.id \
+                 WHERE s.id IS NOT NULL GROUP BY s.id",
             )?;
-            let rows = stmt.query_map([cursor as i64], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<f64>>(1)?,
+                    r.get::<_, Option<f64>>(2)?,
+                ))
+            })?;
             rows.filter_map(Result::ok).collect()
         };
 
+        let now_secs = now.timestamp_millis() as f64 / 1000.0;
+        let cutoff = now_secs - self.idle.as_secs_f64();
+
         let mut out = Vec::new();
-        for session_id in changed {
+        for (session_id, ended_at, last_ts) in candidates {
+            if state.is_marked(ns, &session_id) {
+                continue; // already emitted — never write twice
+            }
+            let settled = ended_at.is_some() || last_ts.is_some_and(|t| t < cutoff);
+            if !settled {
+                continue; // still active — wait for it to settle
+            }
             match self.build_record(&conn, persona, &session_id) {
-                Ok(Some(rec)) => out.push(rec),
+                Ok(Some(rec)) => {
+                    out.push(rec);
+                    state.mark(ns, &session_id);
+                }
                 Ok(None) => {} // session row gone (shouldn't happen) — skip
                 Err(e) => warn!(session = %session_id, error = %e, "hermes: skipping session"),
             }
         }
-        Ok((out, Some(max_id)))
+        Ok(out)
     }
 
     /// Build the current snapshot record for one session id.
@@ -252,22 +279,18 @@ impl PollCollector for HermesCollector {
     }
 
     fn poll(&mut self, state: &mut State) -> Vec<OutputRecord> {
+        let now = Utc::now();
         let mut out = Vec::new();
         for (db_path, persona) in self.enumerate() {
-            let cursor = state.offset_for(&db_path);
-            match self.poll_db(&db_path, &persona, cursor) {
-                Ok((mut recs, new_cursor)) => {
+            let ns = db_path.to_string_lossy().to_string();
+            match self.scan_db(&db_path, &persona, now, &ns, state) {
+                Ok(mut recs) => {
                     if !recs.is_empty() {
-                        debug!(db = %db_path.display(), persona = %persona, sessions = recs.len(), "hermes: emitting");
+                        debug!(db = %db_path.display(), persona = %persona, sessions = recs.len(), "hermes: emitting settled sessions");
                     }
                     out.append(&mut recs);
-                    if let Some(nc) = new_cursor {
-                        if nc != cursor {
-                            state.set_offset(&db_path, nc, Some(Self::now_iso()));
-                        }
-                    }
                 }
-                Err(e) => warn!(db = %db_path.display(), error = %e, "hermes: poll failed"),
+                Err(e) => warn!(db = %db_path.display(), error = %e, "hermes: scan failed"),
             }
         }
         out
@@ -354,16 +377,30 @@ mod tests {
         conn.close().unwrap();
     }
 
-    fn add_message(path: &Path, session_id: &str) -> i64 {
+    fn add_message_at(path: &Path, session_id: &str, ts: f64) -> i64 {
         let conn = Connection::open(path).unwrap();
         conn.execute(
-            "INSERT INTO messages (session_id, role, timestamp) VALUES (?1, 'assistant', 1781561092.0)",
-            [session_id],
+            "INSERT INTO messages (session_id, role, timestamp) VALUES (?1, 'assistant', ?2)",
+            rusqlite::params![session_id, ts],
         )
         .unwrap();
         let id = conn.last_insert_rowid();
         conn.close().unwrap();
         id
+    }
+
+    /// A long-settled message timestamp (~2026-06-15), older than any idle window.
+    const OLD_TS: f64 = 1781561092.0;
+
+    fn now_secs() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    }
+
+    fn collector(home: &Path, idle_secs: u64) -> HermesCollector {
+        HermesCollector::new(home, "testhost".into(), Duration::from_secs(idle_secs))
     }
 
     fn state() -> (tempfile::TempDir, State) {
@@ -381,15 +418,15 @@ mod tests {
     }
 
     #[test]
-    fn emits_one_record_per_session_with_token_mapping() {
+    fn emits_one_settled_record_per_session_with_token_mapping() {
         let home = tempfile::tempdir().unwrap();
         let db = home.path().join("state.db");
         make_db(&db);
         insert_session(&db, "s1", "gpt-5.5", 100, 20, Some(1781561100.5));
-        add_message(&db, "s1");
+        add_message_at(&db, "s1", OLD_TS);
 
         let (_d, mut st) = state();
-        let mut c = HermesCollector::new(home.path(), "testhost".into());
+        let mut c = collector(home.path(), 600);
         let recs = c.poll(&mut st);
         let h = one_hermes(&recs);
 
@@ -413,42 +450,66 @@ mod tests {
     }
 
     #[test]
-    fn second_poll_with_no_new_messages_emits_nothing() {
+    fn each_session_is_emitted_at_most_once() {
         let home = tempfile::tempdir().unwrap();
         let db = home.path().join("state.db");
         make_db(&db);
         insert_session(&db, "s1", "gpt-5.5", 100, 20, None);
-        add_message(&db, "s1");
+        add_message_at(&db, "s1", OLD_TS);
 
         let (_d, mut st) = state();
-        let mut c = HermesCollector::new(home.path(), "h".into());
-        assert_eq!(c.poll(&mut st).len(), 1);
-        // Cursor held: no new messages -> no re-emit.
-        assert!(c.poll(&mut st).is_empty());
+        let mut c = collector(home.path(), 600);
+        assert_eq!(c.poll(&mut st).len(), 1, "settled session emits once");
+
+        // Even if the session grows and gains a new (still-old) message, the
+        // ledger prevents a second write — the NDJSON stays unique.
+        insert_session(&db, "s1", "gpt-5.5", 150, 55, None);
+        add_message_at(&db, "s1", OLD_TS + 1.0);
+        assert!(c.poll(&mut st).is_empty(), "already-emitted session never re-emits");
     }
 
     #[test]
-    fn new_message_re_emits_updated_snapshot() {
+    fn ledger_survives_restart() {
         let home = tempfile::tempdir().unwrap();
         let db = home.path().join("state.db");
         make_db(&db);
         insert_session(&db, "s1", "gpt-5.5", 100, 20, None);
-        add_message(&db, "s1");
+        add_message_at(&db, "s1", OLD_TS);
+
+        let statedir = tempfile::tempdir().unwrap();
+        {
+            let mut st = State::load(statedir.path()).unwrap();
+            let mut c = collector(home.path(), 600);
+            assert_eq!(c.poll(&mut st).len(), 1);
+            st.save().unwrap();
+        }
+        // Fresh State load (simulated restart) must not re-emit the session.
+        let mut st = State::load(statedir.path()).unwrap();
+        let mut c = collector(home.path(), 600);
+        assert!(c.poll(&mut st).is_empty(), "persisted ledger blocks re-emit after restart");
+    }
+
+    #[test]
+    fn active_session_waits_until_settled() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("state.db");
+        make_db(&db);
+        // Session with a brand-new message and no ended_at: still active.
+        insert_session(&db, "s1", "gpt-5.5", 100, 20, None);
+        add_message_at(&db, "s1", now_secs());
 
         let (_d, mut st) = state();
-        let mut c = HermesCollector::new(home.path(), "h".into());
-        let first = one_hermes(&c.poll(&mut st)).tokens.output;
-        assert_eq!(first, 20);
+        let mut c = collector(home.path(), 3600); // 1h idle window
+        assert!(c.poll(&mut st).is_empty(), "fresh active session is not emitted yet");
 
-        // Session grows: more tokens + a new message.
-        insert_session(&db, "s1", "gpt-5.5", 150, 55, None);
-        add_message(&db, "s1");
-
+        // Marking it ended finalizes it immediately, regardless of idle window.
+        insert_session(&db, "s1", "gpt-5.5", 120, 30, Some(now_secs()));
         let recs = c.poll(&mut st);
         let h = one_hermes(&recs);
-        assert_eq!(h.hermes.session_id, "s1");
-        assert_eq!(h.tokens.output, 55); // updated snapshot
-        assert_eq!(h.tokens.input, 150);
+        assert_eq!(h.tokens.output, 30);
+        assert!(h.hermes.ended);
+        // ...and only once.
+        assert!(c.poll(&mut st).is_empty());
     }
 
     #[test]
@@ -459,10 +520,10 @@ mod tests {
         let db = prof.join("state.db");
         make_db(&db);
         insert_session(&db, "p1", "gpt-5.4-mini", 10, 5, None);
-        add_message(&db, "p1");
+        add_message_at(&db, "p1", OLD_TS);
 
         let (_d, mut st) = state();
-        let mut c = HermesCollector::new(home.path(), "h".into());
+        let mut c = collector(home.path(), 600);
         let recs = c.poll(&mut st);
         let h = one_hermes(&recs);
         assert_eq!(h.hermes.persona, "aitube");
