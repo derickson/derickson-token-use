@@ -122,7 +122,7 @@ local yml.
 
 ```bash
 ./mac-filebeat-install.sh        # 1st run: downloads Filebeat, creates local config, stops
-#   edit ./filebeat-token-use.yml  (set the API key; host/routing pre-filled)
+#   edit ./filebeat-token-use.yml  (set the Elasticsearch host + API key; routing pre-filled)
 ./mac-filebeat-install.sh        # 2nd run: validates, registers launchd service
 ./mac-filebeat-install.sh --uninstall   # stop + remove the service
 ./mac-reprocess.sh               # reset the registry + re-ship every *.ndjson
@@ -143,15 +143,22 @@ What it does:
 - Registers a **launchd agent** (`com.derickson.token-use-filebeat`, `RunAtLoad` +
   `KeepAlive`) so Filebeat runs at boot without a login.
 
-The example is pre-filled from a Fleet-managed host's `elastic-agent inspect`:
+The example carries the routing/parsing taken from a Fleet-managed host's
+`elastic-agent inspect`:
 - same NDJSON parser (`target: ""`, `overwrite_keys`, `add_error_key`),
-- same Elastic Cloud `output.elasticsearch.hosts`,
 - direct routing to `logs-<event.dataset>-dericksontokenuse`
   (see [Data stream routing](#data-stream-routing)).
 
-The **only** thing you supply is a **dedicated** API key (do *not* reuse the Fleet
-agent's key). In Kibana → *Stack Management → API keys*, create one whose role
-descriptor allows writing the token-use data streams, e.g.:
+You supply **two** values, both kept out of git (the committed example has only
+`__ES_HOST__` / `__ID__:__API_KEY__` placeholders):
+
+1. **The Elasticsearch host** (`output.elasticsearch.hosts`) — your Elastic Cloud
+   deployment endpoint, form `https://<deployment-id>.<region>.<csp>.elastic.cloud:443`.
+   Read it from your Fleet agent's `elastic-agent inspect` (the
+   `output.elasticsearch.hosts` value) or copy it from the Elastic Cloud console.
+2. **A dedicated API key** (do *not* reuse the Fleet agent's key). In Kibana →
+   *Stack Management → API keys*, create one whose role descriptor allows writing
+   the token-use data streams, e.g.:
 
 ```json
 { "token-use-filebeat": {
@@ -166,8 +173,8 @@ version check at startup (and `filebeat test output` does the same). Without it
 you get `403 ... action [cluster:monitor/main] is unauthorized`. The `indices`
 block alone is enough to *write* data but not to pass that check.
 
-Paste it into `filebeat-token-use.yml` in `id:key` form, then re-run
-`./mac-filebeat-install.sh`.
+Paste the host and the key (in `id:key` form) into `filebeat-token-use.yml`, then
+re-run `./mac-filebeat-install.sh`.
 
 ### Data stream routing
 The shipper writes each record straight to its final data stream by

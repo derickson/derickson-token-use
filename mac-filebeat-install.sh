@@ -70,18 +70,23 @@ if [[ ! -f "$CONFIG" ]]; then
   chmod 0600 "$CONFIG"
   echo
   echo "==> Created $CONFIG from the example."
-  echo "    The host / data stream / pipeline already match the Fleet integration."
-  echo "    EDIT it and set the API key (output.elasticsearch.api_key, id:key form):"
-  echo "      api_key: \"__ID__:__API_KEY__\"   ->   \"<id>:<key>\""
-  echo "    Mint a dedicated key in Kibana (see README), then re-run:"
+  echo "    The data stream / pipeline routing already match the Fleet integration."
+  echo "    EDIT it and set TWO values (both are kept out of git):"
+  echo "      1. the Elasticsearch host (output.elasticsearch.hosts):"
+  echo "         hosts: [\"__ES_HOST__\"]  ->  [\"https://<deployment-id>.<region>.<csp>.elastic.cloud:443\"]"
+  echo "      2. the API key (output.elasticsearch.api_key, id:key form):"
+  echo "         api_key: \"__ID__:__API_KEY__\"   ->   \"<id>:<key>\""
+  echo "    Get the host from \`elastic-agent inspect\` or the Cloud console; mint a"
+  echo "    dedicated key in Kibana (see README), then re-run:"
   echo "      ./mac-filebeat-install.sh"
   exit 0
 fi
 # Filebeat refuses to load a config that is group/world writable.
 chmod 0600 "$CONFIG"
 
-if grep -q '__\(API_KEY\|ID\)__' "$CONFIG"; then
-  echo "==> $CONFIG still has the __ID__:__API_KEY__ placeholder. Set the API key, then re-run." >&2
+if grep -q '__\(API_KEY\|ID\|ES_HOST\)__' "$CONFIG"; then
+  echo "==> $CONFIG still has __ placeholders. Set the Elasticsearch host (__ES_HOST__)" >&2
+  echo "    and API key (__ID__:__API_KEY__), then re-run." >&2
   exit 1
 fi
 

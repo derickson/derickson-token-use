@@ -5,14 +5,19 @@
 #
 # This is the committed EXAMPLE. mac-filebeat-install.sh copies it to
 #   ./filebeat-token-use.yml        (gitignored, chmod 0600)
-# on first run. The only value you MUST fill in is the API key; the host /
-# data stream / pipeline below already match the Fleet integration.
+# on first run. You MUST fill in two values: the Elasticsearch host and the API
+# key. The data stream / pipeline routing below already match the Fleet integration.
 #
-# Values were taken from a Fleet-managed host's `elastic-agent inspect`:
+# The host and API key identify (and grant write access to) your Elastic Cloud
+# deployment, so they are kept OUT of git — this committed example carries only
+# __ES_HOST__ / __ID__:__API_KEY__ placeholders. Get the host from your Fleet-
+# managed agent's `elastic-agent inspect` (output.elasticsearch.hosts) or the
+# Elastic Cloud console; mint the API key per the README.
+#
+# Other values were taken from a Fleet-managed host's `elastic-agent inspect`:
 #   - filestream input "token-use": data_stream.namespace = dericksontokenuse,
 #     data_stream.dataset = filestream.generic, pipeline = token-use-id
 #   - ndjson parser: target "", overwrite_keys, add_error_key
-#   - output.elasticsearch.hosts (the Elastic Cloud deployment)
 
 filebeat.inputs:
   - type: filestream
@@ -31,7 +36,8 @@ filebeat.inputs:
           add_error_key: true
 
 output.elasticsearch:
-  # Same Elastic Cloud deployment the Fleet agent ships to.
+  # Your Elastic Cloud deployment endpoint (the same one the Fleet agent ships
+  # to). Form: https://<deployment-id>.<region>.<csp>.elastic.cloud:443
   hosts: ["__ES_HOST__"]
 
   # Dedicated, scoped API key in "id:key" form (NOT the base64 header form, and
