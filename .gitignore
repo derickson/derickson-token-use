@@ -9,3 +9,5 @@
 # Local Elastic Agent config dump used to derive the Filebeat config (has hosts,
 # signed policy blob); keep it out of git.
 /ea-inspect.yml
+
+result

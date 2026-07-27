@@ -34,9 +34,10 @@ your pinned package set (no version drift):
 inputs = {
   # ... your existing inputs (nixpkgs, home-manager, ...)
   token-use = {
-    # Public repo: github:derickson/derickson-token-use
-    # Private repo: reuse your SSH key instead of a token:
-    url = "git+ssh://git@github.com/derickson/derickson-token-use.git";
+    # Public repo → use the github: (HTTPS) fetcher. This matters because
+    # nixos-rebuild runs under sudo, and root has no GitHub SSH key — a
+    # git+ssh:// URL would fail with "Permission denied (publickey)".
+    url = "github:derickson/derickson-token-use";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 };
