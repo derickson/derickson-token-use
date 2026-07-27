@@ -79,6 +79,15 @@ Output NDJSON lands in:
 - Linux: `~/.local/share/token-use/logs/`
 - macOS: `~/Library/Application Support/token-use/logs/`
 
+### NixOS (flakes)
+**NixOS users: don't run `install.sh`.** This repo is a flake that builds the
+collector reproducibly and ships a home-manager module (plus a system-level
+module) that registers the same systemd **user** service declaratively. Full
+instructions — inputs, options, and management — are in **[README-nix.md](README-nix.md)**.
+
+TL;DR: add the flake input, `imports = [ inputs.token-use.homeModules.default ]`,
+`services.token-use.enable = true;`, and `nixos-rebuild switch`.
+
 ### Run manually
 ```bash
 TOKEN_USE_OUT_DIR=./logs cargo run --release
@@ -215,9 +224,12 @@ src/
   daemon.rs            backfill + watch loop + tick
   config.rs main.rs error.rs
 deploy/                systemd unit, launchd plists, standalone filebeat example
+flake.nix              Nix flake: package + home-manager/NixOS modules
+nix/                   the module implementations (see README-nix.md)
 install.sh             build + install the collector service (Linux/macOS)
 status.sh              health check: collector + shipper (Linux/macOS)
 reset.sh               stop, wipe output + checkpoint, restart (full backfill)
 mac-filebeat-install.sh  standalone Filebeat shipper for un-Fleet-able Macs
 mac-reprocess.sh         reset the Filebeat registry + re-ship all NDJSON
+README-nix.md            NixOS install guide (flake input + modules)
 ```
