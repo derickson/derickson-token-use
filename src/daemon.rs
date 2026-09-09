@@ -13,6 +13,7 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use tracing::{debug, info, warn};
 
 use crate::collector::claude_code::ClaudeCodeCollector;
+use crate::collector::codex::CodexCollector;
 use crate::collector::hermes::HermesCollector;
 use crate::collector::{Collector, PollCollector};
 use crate::config::Config;
@@ -39,8 +40,10 @@ impl Daemon {
         let host = gethostname::gethostname().to_string_lossy().to_string();
         info!(host = %host, "starting token-use daemon");
 
-        let collectors: Vec<Box<dyn Collector>> =
-            vec![Box::new(ClaudeCodeCollector::new(&config.home, host.clone()))];
+        let collectors: Vec<Box<dyn Collector>> = vec![
+            Box::new(ClaudeCodeCollector::new(&config.home, host.clone())),
+            Box::new(CodexCollector::new(&config.codex_dir, host.clone())),
+        ];
         let poll_collectors: Vec<Box<dyn PollCollector>> =
             vec![Box::new(HermesCollector::new(&config.hermes_dir, host, config.hermes_idle))];
 

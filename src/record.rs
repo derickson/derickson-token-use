@@ -41,14 +41,19 @@ impl OutputRecord {
         }
     }
 
-    /// Idempotency key for cross-restart dedup. Calls dedup on `message.id`;
+    /// Idempotency key for cross-restart dedup. Calls dedup on the provider's
+    /// per-response id (`message.id` for Claude Code, `response_id` for Codex);
     /// turns have no stable key (offset checkpointing covers them). Hermes
     /// records return `None` *by design*: a session is re-emitted as it grows,
     /// so the in-process recent-id ring must not suppress legitimate updates —
     /// the per-DB cursor already gates re-emits and ES upserts by `_id`.
     pub fn dedup_key(&self) -> Option<&str> {
         match self {
-            OutputRecord::Call(c) => Some(&c.claude.message_id),
+            OutputRecord::Call(c) => match (&c.claude, &c.codex) {
+                (Some(m), _) => Some(&m.message_id),
+                (_, Some(m)) => Some(&m.response_id),
+                _ => None,
+            },
             OutputRecord::Turn(_) => None,
             OutputRecord::Hermes(_) => None,
         }
@@ -88,9 +93,18 @@ pub struct CallRecord {
     pub provider: &'static str,
     pub model: String,
     pub host: Host,
-    pub claude: ClaudeMeta,
+    /// Provider-specific metadata: exactly one of `claude`/`codex` is set, named
+    /// per source so a new collector never reshapes an existing one's fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude: Option<ClaudeMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexMeta>,
     pub tokens: Tokens,
-    pub perf: Perf,
+    /// Per-call inference throughput, when the source records enough timing to
+    /// derive it. Absent for providers whose transcripts carry a single
+    /// timestamp per response (Codex) — see [`Perf`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perf: Option<Perf>,
     pub tools: Tools,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<ServerToolUse>,
@@ -116,6 +130,37 @@ pub struct ClaudeMeta {
     pub entrypoint: Option<String>,
 }
 
+/// Codex CLI per-call metadata, from a `token_usage_record` rollout line plus
+/// the session/turn context that precedes it.
+///
+/// `project` holds the session `cwd`, deliberately the same field name and
+/// meaning as [`ClaudeMeta::project`], so a Kibana view can group by project
+/// across both services.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexMeta {
+    /// OpenAI response id — the per-call idempotency key, parallel to Claude's
+    /// `message_id`.
+    pub response_id: String,
+    /// Duplicate of the top-level `model` kept for provider-specific fidelity.
+    pub model: String,
+    pub session_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    /// Differs from `turn_id` when the call belongs to a nested (sub-agent) turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_turn_id: Option<String>,
+    pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// Which Codex surface produced the session, e.g. `"Codex Desktop"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub originator: Option<String>,
+    /// Reasoning effort in force for the turn (`"low"`/`"medium"`/`"high"`) — a
+    /// first-order driver of `tokens.reasoning`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
 /// Token breakdown. Prompt side = `input + cache_read_input + cache_creation_input`
 /// (surfaced as `total_input`); response side = `output`.
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +180,12 @@ pub struct Tokens {
 }
 
 /// Derived per-call inference throughput.
+///
+/// This needs a *within-response* time window, which only exists when the source
+/// timestamps a response's individual content blocks (Claude Code does). Codex
+/// rollouts carry one timestamp per line, so the whole struct is omitted there
+/// rather than reported as a fabricated zero — turn-level `duration_ms`, which
+/// Codex does record, remains available on [`TurnRecord`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Perf {
     /// `max(block_ts) - min(block_ts)` in ms across the call's content blocks.
@@ -170,7 +221,11 @@ pub struct TurnRecord {
     pub service: Service,
     pub provider: &'static str,
     pub host: Host,
-    pub claude: TurnMeta,
+    /// Provider-specific metadata; exactly one is set, as on [`CallRecord`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude: Option<TurnMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexTurnMeta>,
     pub turn: Turn,
 }
 
@@ -182,6 +237,26 @@ pub struct TurnMeta {
     pub git_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
+}
+
+/// Codex per-turn metadata, from a `task_complete` event and its `turn_context`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexTurnMeta {
+    pub session_id: String,
+    pub turn_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_turn_id: Option<String>,
+    pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub originator: Option<String>,
+    /// Latency to the turn's first output token, as reported by Codex. Codex
+    /// specific: Claude Code's turn boundary carries no equivalent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_first_token_ms: Option<i64>,
 }
 
 /// Turn-level metrics. `tokens_per_sec` here is *effective* throughput — it

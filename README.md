@@ -5,10 +5,11 @@ high-fidelity, **per-API-call** token-usage log in NDJSON — ready for an
 Elasticsearch **filestream / Filebeat** integration to pick up.
 
 It exists to close the gap Elastic's cloud integrations leave: token spend from
-API calls made on **your own laptops and servers**. It ships with two
-integrations — **Anthropic Claude Code** (tailing `~/.claude` transcripts) and the
-**Hermes AI agent** (polling its `~/.hermes` SQLite state) — and the collector
-layer is pluggable so OpenAI, Ollama, and others can be added later.
+API calls made on **your own laptops and servers**. It ships with three
+integrations — **Anthropic Claude Code** (tailing `~/.claude` transcripts),
+**OpenAI Codex CLI** (tailing `~/.codex` rollout logs), and the **Hermes AI
+agent** (polling its `~/.hermes` SQLite state) — and the collector layer is
+pluggable so Ollama and others can be added later.
 
 Every record identifies the **provider**, **model**, **service**, **host**, and
 **project**, with a full prompt-vs-response token breakdown and derived
@@ -25,6 +26,8 @@ so one Kibana view can slice every source.
 |---|---|---|
 | `claude_code.token_usage` | API call (`message.id`) | prompt/response tokens, cache read/creation breakdown, `perf.tokens_per_sec` + `generation_ms`, `tools.use_count`/`names`, `stop_reason` |
 | `claude_code.turn` | agent turn (`turn_duration`) | `turn.duration_ms`, summed `output_tokens`, effective `tokens_per_sec` |
+| `codex.token_usage` | API call (`response_id`) | prompt/response tokens, cached + cache-write breakdown, `tokens.reasoning`, `tools.use_count`/`names`, `codex.model` (per turn), `reasoning_effort` |
+| `codex.turn` | agent turn (`task_complete`) | `turn.duration_ms`, Codex's own turn `output_tokens`, effective `tokens_per_sec`, `codex.time_to_first_token_ms` |
 | `hermes.token_usage` | Hermes session | per-session `input`/`output`/`cache_read`/`cache_creation(=cache write)`/`reasoning` tokens, `provider` (`billing_provider`, e.g. `openai-codex`), `model` (e.g. `gpt-5.5`), `hermes.persona`, `source`, cost + `duration_ms` |
 
 ### Hermes specifics
@@ -41,6 +44,30 @@ of once-only is that a settled session which later resumes is not re-emitted;
 `ended_at` is the precise signal and always wins. `hermes.persona` is `default`
 for the root DB or the profile directory name otherwise.
 
+### Codex specifics
+Codex CLI writes append-only JSONL rollout logs to
+`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<session-uuid>.jsonl`, so it's tailed
+like a Claude Code transcript. Each API response produces one complete
+`token_usage_record` line, which is therefore the call boundary directly — no
+accumulation needed. Three differences worth knowing:
+- **No per-call `perf`.** A rollout line carries a single timestamp, so a
+  response's internal generation window doesn't exist in the data; the `perf`
+  object is **omitted** rather than reported as a zero that would skew
+  cross-provider averages. Turn `duration_ms` is real and is emitted.
+  A call's `@timestamp` is thus the response *completion* time.
+- **Token semantics are normalized.** OpenAI's `input_tokens` is *inclusive* of
+  the cached and cache-write portions, unlike Anthropic's. `tokens.input` carries
+  the fresh remainder so that
+  `input + cache_read_input + cache_creation_input == total_input` holds for every
+  provider, and `total_input` keeps Codex's own prompt figure.
+- **The model is resolved per turn** (from `turn_context`, falling back to
+  `session_meta`), because a Codex session can switch models mid-session.
+
+Codex releases before ~0.15 logged per-call usage in `token_count` events with no
+`response_id`; current releases write *both*, so only `token_usage_record` is
+read (consuming both would double-count) and those legacy rollouts are not
+captured.
+
 ### Derived-metric methodology
 - **Per-call** `generation_ms` = span between a response's first and last
   streamed content-block timestamps; `tokens_per_sec` = `output / generation_ms`.
@@ -51,8 +78,8 @@ for the root DB or the profile directory name otherwise.
   deliberately a different number, kept in a separate dataset.
 
 ## How it works
-There are two collector seams: a line-tailed **`Collector`** (Claude Code) and a
-**`PollCollector`** for sources that don't fit byte-tailing (Hermes/SQLite).
+There are two collector seams: a line-tailed **`Collector`** (Claude Code, Codex)
+and a **`PollCollector`** for sources that don't fit byte-tailing (Hermes/SQLite).
 
 **Claude Code (tail):**
 - Watches `~/.claude/projects` with a debounced filesystem watcher (`notify`).
@@ -62,6 +89,18 @@ There are two collector seams: a line-tailed **`Collector`** (Claude Code) and a
   `usage`; the collector **accumulates by `message.id` and finalizes on the next
   boundary**, so each call is counted **exactly once** (verified: emitted call
   count == distinct `message.id` count).
+
+**Codex (tail):**
+- Watches `~/.codex/sessions` with the same debounced watcher and byte-offset
+  tailer.
+- Emits a call on each `token_usage_record` line, dedup'd on `response_id`. Tool
+  calls are written *before* the usage record that closes the response, so they
+  are buffered and attached to the call that follows them.
+- Turns are tracked by `turn_id` (so a nested sub-agent turn can't reset its
+  parent's totals) and emitted on `task_complete`, which carries an explicit
+  `duration_ms`. A turn that saw no usage record is dropped rather than reported
+  with a fabricated zero (verified against real rollouts: emitted call count ==
+  `token_usage_record` line count).
 
 **Hermes (poll):**
 - Each persona DB is opened **read-only**; a poll scans sessions and emits each
@@ -177,6 +216,7 @@ nothing and exits non-zero if the collector or all shippers are down (handy for
 | `TOKEN_USE_OUT_DIR` | `./logs` | NDJSON output directory |
 | `TOKEN_USE_STATE_DIR` | XDG state / App Support | checkpoint (`state.json`) |
 | `TOKEN_USE_HOME` | `$HOME` | locate `~/.claude` (handy for testing) |
+| `TOKEN_USE_CODEX_DIR` | `$HOME/.codex` | Codex CLI install dir (its `sessions/` holds the rollout logs) |
 | `TOKEN_USE_HERMES_DIR` | `$HOME/.hermes` | Hermes install dir (the SQLite poll source) |
 | `TOKEN_USE_HERMES_IDLE_SECS` | `600` | idle window before a Hermes session is finalized + emitted once |
 | `TOKEN_USE_DEBOUNCE_MS` | `1500` | FS-event debounce window |
@@ -290,6 +330,7 @@ src/
   collector/
     mod.rs             Collector + PollCollector traits (the per-service seams)
     claude_code.rs     Anthropic Claude Code collector (line tailer)
+    codex.rs           OpenAI Codex CLI collector (rollout JSONL tail)
     hermes.rs          Hermes collector (SQLite poll source)
   daemon.rs            backfill + watch loop + tick (+ poll sources)
   config.rs main.rs error.rs

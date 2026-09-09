@@ -13,6 +13,7 @@ use crate::record::OutputRecord;
 use crate::state::State;
 
 pub mod claude_code;
+pub mod codex;
 pub mod hermes;
 
 pub trait Collector: Send {

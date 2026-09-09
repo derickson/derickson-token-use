@@ -111,7 +111,7 @@ impl ClaudeCodeCollector {
             host: Host {
                 name: self.host.clone(),
             },
-            claude: ClaudeMeta {
+            claude: Some(ClaudeMeta {
                 message_id: call.message_id,
                 request_id: call.request_id,
                 model: call.model,
@@ -122,7 +122,8 @@ impl ClaudeCodeCollector {
                 is_sidechain: call.is_sidechain,
                 stop_reason: call.stop_reason,
                 entrypoint: call.entrypoint,
-            },
+            }),
+            codex: None,
             tokens: Tokens {
                 input: u.input,
                 output: u.output,
@@ -134,10 +135,10 @@ impl ClaudeCodeCollector {
                 total: total_input + u.output,
                 reasoning: None,
             },
-            perf: Perf {
+            perf: Some(Perf {
                 generation_ms,
                 tokens_per_sec: tokens_per_sec(u.output, generation_ms),
-            },
+            }),
             tools: Tools {
                 use_count: call.tool_count,
                 names: call.tool_names.into_iter().collect(),
@@ -177,12 +178,13 @@ impl ClaudeCodeCollector {
             host: Host {
                 name: self.host.clone(),
             },
-            claude: TurnMeta {
+            claude: Some(TurnMeta {
                 session_id: str_field(v, "sessionId").unwrap_or_default(),
                 project: str_field(v, "cwd").unwrap_or_default(),
                 git_branch: str_field(v, "gitBranch"),
                 entrypoint: str_field(v, "entrypoint"),
-            },
+            }),
+            codex: None,
             turn: Turn {
                 duration_ms,
                 message_count,
@@ -449,12 +451,13 @@ mod tests {
         assert_eq!(recs.len(), 1);
         let OutputRecord::Call(call) = &recs[0] else { panic!("expected call") };
 
-        assert_eq!(call.claude.message_id, "msg_A");
+        assert_eq!(call.claude.as_ref().unwrap().message_id, "msg_A");
         assert_eq!(call.tokens.output, 300);
         assert_eq!(call.tokens.cache_read_input, 100);
         assert_eq!(call.tokens.total_input, 10 + 100 + 20);
-        assert_eq!(call.perf.generation_ms, 5000); // 10:00:05 - 10:00:00
-        assert_eq!(call.perf.tokens_per_sec, Some(60.0)); // 300 / 5s
+        let perf = call.perf.as_ref().unwrap();
+        assert_eq!(perf.generation_ms, 5000); // 10:00:05 - 10:00:00
+        assert_eq!(perf.tokens_per_sec, Some(60.0)); // 300 / 5s
         assert_eq!(call.tools.use_count, 1);
         assert_eq!(call.tools.names, vec!["Bash".to_string()]);
         assert_eq!(call.provider, "anthropic");
@@ -470,8 +473,9 @@ mod tests {
         let recs = c.flush(p);
         assert_eq!(recs.len(), 1);
         let OutputRecord::Call(call) = &recs[0] else { panic!() };
-        assert_eq!(call.perf.generation_ms, 0);
-        assert_eq!(call.perf.tokens_per_sec, None);
+        let perf = call.perf.as_ref().unwrap();
+        assert_eq!(perf.generation_ms, 0);
+        assert_eq!(perf.tokens_per_sec, None);
     }
 
     #[test]
@@ -482,7 +486,7 @@ mod tests {
         // New message id finalizes msg_A.
         let recs = c.consume_line(p, &assistant_line("msg_C", "2026-06-16T10:00:01.000Z", r#"{"type":"text"}"#, 10)).unwrap();
         assert_eq!(recs.len(), 1);
-        assert!(matches!(&recs[0], OutputRecord::Call(c) if c.claude.message_id == "msg_A"));
+        assert!(matches!(&recs[0], OutputRecord::Call(c) if c.claude.as_ref().unwrap().message_id == "msg_A"));
     }
 
     #[test]

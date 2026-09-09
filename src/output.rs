@@ -67,7 +67,7 @@ mod tests {
             provider: "anthropic",
             model: "claude-opus-4-8".into(),
             host: Host { name: "h".into() },
-            claude: ClaudeMeta {
+            claude: Some(ClaudeMeta {
                 message_id: "msg_1".into(),
                 request_id: None,
                 model: "claude-opus-4-8".into(),
@@ -78,13 +78,14 @@ mod tests {
                 is_sidechain: false,
                 stop_reason: None,
                 entrypoint: None,
-            },
+            }),
+            codex: None,
             tokens: Tokens {
                 input: 1, output: 2, cache_read_input: 0, cache_creation_input: 0,
                 cache_creation_ephemeral_5m_input: 0, cache_creation_ephemeral_1h_input: 0,
                 total_input: 1, total: 3, reasoning: None,
             },
-            perf: Perf { generation_ms: 0, tokens_per_sec: None },
+            perf: Some(Perf { generation_ms: 0, tokens_per_sec: None }),
             tools: Tools { use_count: 0, names: vec![] },
             server_tool_use: None,
         }))

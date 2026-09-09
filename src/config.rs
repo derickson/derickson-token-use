@@ -16,6 +16,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Home directory used to locate per-service transcript roots.
     pub home: PathBuf,
+    /// Root of the Codex CLI install, normally `~/.codex`; its `sessions/`
+    /// subdirectory holds the rollout transcripts.
+    pub codex_dir: PathBuf,
     /// Root of the Hermes install (the SQLite poll source), normally `~/.hermes`.
     pub hermes_dir: PathBuf,
     /// A Hermes session is finalized and emitted **once** after it has been idle
@@ -35,6 +38,7 @@ impl Config {
     ///   * `TOKEN_USE_OUT_DIR`   — output dir (default: `<cwd-of-project>/logs`)
     ///   * `TOKEN_USE_STATE_DIR` — state dir (default: XDG state / App Support)
     ///   * `TOKEN_USE_HOME`      — home override (default: `$HOME`)
+    ///   * `TOKEN_USE_CODEX_DIR`  — Codex install dir (default: `$HOME/.codex`)
     ///   * `TOKEN_USE_HERMES_DIR` — Hermes install dir (default: `$HOME/.hermes`)
     ///   * `TOKEN_USE_HERMES_IDLE_SECS` — settle window before a session is
     ///     emitted once (default 600)
@@ -45,6 +49,10 @@ impl Config {
             .map(PathBuf::from)
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."));
+
+        let codex_dir = std::env::var_os("TOKEN_USE_CODEX_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"));
 
         let hermes_dir = std::env::var_os("TOKEN_USE_HERMES_DIR")
             .map(PathBuf::from)
@@ -79,6 +87,7 @@ impl Config {
             out_dir,
             state_dir,
             home,
+            codex_dir,
             hermes_dir,
             hermes_idle,
             debounce,
