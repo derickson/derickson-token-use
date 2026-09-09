@@ -44,6 +44,36 @@ of once-only is that a settled session which later resumes is not re-emitted;
 `ended_at` is the precise signal and always wins. `hermes.persona` is `default`
 for the root DB or the profile directory name otherwise.
 
+### Token classes (the basis for downstream cost)
+token-use emits **counts only** — it never prices tokens. The breakdown is kept
+in the four classes that bill at different rates, so a downstream dashboard can
+multiply each by its own rate exactly once:
+
+| Field | Billed as |
+|---|---|
+| `tokens.input` | fresh (uncached) prompt — full input rate |
+| `tokens.cache_read_input` | cache hit — heavily discounted |
+| `tokens.cache_creation_input` | cache write — premium over input |
+| `tokens.output` | full output rate |
+
+`tokens.input` means the **fresh** portion for every provider, so
+`input + cache_read_input + cache_creation_input == total_input` always holds.
+This normalization is load-bearing: Anthropic's `input_tokens` already excludes
+the cache classes, while OpenAI's is *inclusive* of them, so the raw provider
+numbers are not comparable. Two consequences:
+
+- **Don't multiply `total_input` by the input rate.** It contains the discounted
+  cache-read tokens — on a cache-heavy Codex session those are 70–95% of the
+  prompt, so that formula overcharges by several-fold. Use the three prompt
+  fields separately.
+- **Don't add `tokens.reasoning` to `tokens.output`.** Reasoning is a *subset* of
+  output, not an addition (verified: `total_tokens == input + output` on every
+  Codex record). It's exposed for visibility into what drives output cost.
+
+`cache_creation_ephemeral_5m_input` / `_1h_input` split Anthropic's cache writes
+by TTL, which bill differently; Codex reports no TTL split and leaves them `0`,
+so cache-write cost must come from `cache_creation_input`, not the split.
+
 ### Codex specifics
 Codex CLI writes append-only JSONL rollout logs to
 `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<session-uuid>.jsonl`, so it's tailed

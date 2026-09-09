@@ -492,9 +492,33 @@ impl CodexUsage {
     /// Map onto the shared [`Tokens`] schema, whose `input` means the *fresh*
     /// (non-cached) prompt portion so that
     /// `input + cache_read_input + cache_creation_input == total_input` holds for
-    /// every provider. `total_input` therefore keeps Codex's own prompt figure.
+    /// every provider — the identity a downstream cost formula relies on to
+    /// multiply each token class by its own rate exactly once.
+    ///
+    /// Which requires knowing whether Codex reports the cache components
+    /// *inside* `input_tokens` or in addition to it. Codex's own accounting
+    /// settles it: `total_tokens == input_tokens + output_tokens` holds on every
+    /// real rollout record, including ones where `cached` is 90% of the prompt.
+    /// Any prompt token Codex counts must therefore already be inside
+    /// `input_tokens`, or its own total would omit it — so the components are
+    /// subtracted out to recover the fresh portion.
+    ///
+    /// `cache_write` is zero in every rollout observed here, so that field alone
+    /// is reasoned about rather than measured. The two conventions are
+    /// indistinguishable from a single record whenever the components fit inside
+    /// the prompt, so the `else` branch below is a *guard*, not a detector: it
+    /// only catches the case where the inclusive reading is arithmetically
+    /// impossible, and keeps that from silently saturating the fresh count to
+    /// zero and losing premium-billed tokens.
     fn to_tokens(&self) -> Tokens {
-        let fresh = self.prompt.saturating_sub(self.cached + self.cache_write);
+        let components = self.cached + self.cache_write;
+        let (fresh, total_input) = if components <= self.prompt {
+            // Inclusive reporting (Codex/OpenAI): `input_tokens` contains them.
+            (self.prompt - components, self.prompt)
+        } else {
+            // Impossible under the inclusive reading — sum so nothing is lost.
+            (self.prompt, self.prompt + components)
+        };
         Tokens {
             input: fresh,
             output: self.output,
@@ -503,8 +527,8 @@ impl CodexUsage {
             // Codex reports no cache-TTL split.
             cache_creation_ephemeral_5m_input: 0,
             cache_creation_ephemeral_1h_input: 0,
-            total_input: self.prompt,
-            total: self.prompt + self.output,
+            total_input,
+            total: total_input + self.output,
             reasoning: Some(self.reasoning),
         }
     }
@@ -645,6 +669,58 @@ mod tests {
         assert_eq!(call.tools.use_count, 1);
         assert_eq!(call.tools.names, vec!["exec".to_string()]);
         assert!(call.server_tool_use.is_none());
+    }
+
+    /// The prompt-side breakdown must never double-count or lose a token,
+    /// because a downstream cost model multiplies each class by its own rate.
+    #[test]
+    fn prompt_breakdown_sums_to_total_under_both_reporting_conventions() {
+        // Inclusive (OpenAI, as observed): input_tokens contains the cache parts.
+        let inclusive = CodexUsage {
+            prompt: 25091,
+            cached: 17920,
+            cache_write: 100,
+            output: 130,
+            reasoning: 17,
+        }
+        .to_tokens();
+        assert_eq!(inclusive.input, 25091 - 17920 - 100);
+        assert_eq!(inclusive.total_input, 25091, "prompt figure is preserved");
+        assert_eq!(
+            inclusive.input + inclusive.cache_read_input + inclusive.cache_creation_input,
+            inclusive.total_input
+        );
+        assert_eq!(inclusive.total, 25091 + 130);
+
+        // Fully cached prompt: fresh input is zero, nothing is lost.
+        let all_cached = CodexUsage {
+            prompt: 1000,
+            cached: 1000,
+            cache_write: 0,
+            output: 10,
+            reasoning: 0,
+        }
+        .to_tokens();
+        assert_eq!(all_cached.input, 0);
+        assert_eq!(all_cached.total_input, 1000);
+
+        // Guard: components larger than the prompt make the inclusive reading
+        // impossible, so they are summed rather than saturating the fresh count
+        // to zero and losing premium-billed cache-write tokens.
+        let impossible = CodexUsage {
+            prompt: 900,
+            cached: 1000,
+            cache_write: 50,
+            output: 10,
+            reasoning: 0,
+        }
+        .to_tokens();
+        assert_eq!(impossible.input, 900);
+        assert_eq!(impossible.total_input, 900 + 1000 + 50, "no cache tokens lost");
+        assert_eq!(
+            impossible.input + impossible.cache_read_input + impossible.cache_creation_input,
+            impossible.total_input
+        );
     }
 
     #[test]
