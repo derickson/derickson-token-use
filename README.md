@@ -312,9 +312,25 @@ You supply **two** values, both kept out of git (the committed example has only
 { "token-use-filebeat": {
   "cluster": ["monitor"],
   "indices": [ {
-    "names": ["logs-claude_code.*-dericksontokenuse"],
+    "names": ["logs-*-dericksontokenuse"],
     "privileges": ["auto_configure", "create_doc"] } ] } }
 ```
+
+**Scope the pattern to `logs-*-dericksontokenuse`, not to one dataset.** The key
+must be able to *auto-create* each data stream on first write, so a key scoped to
+`logs-claude_code.*-dericksontokenuse` silently breaks the moment a new collector
+emits a new `event.dataset`: Filebeat gets
+
+```
+security_exception: action [indices:admin/auto_create] is unauthorized ...
+on indices [logs-codex.token_usage-dericksontokenuse]
+```
+
+and — because that is a non-retryable 4xx — it **drops those events and advances
+its cursor**, so the collector looks healthy, the NDJSON on disk looks correct,
+and the data stream simply never appears in Kibana. The suffix still confines the
+key to this project's streams. After rotating the key, update
+`filebeat-token-use.yml` and restart the shipper.
 
 The `cluster: ["monitor"]` privilege is required: Filebeat calls `GET /` for a
 version check at startup (and `filebeat test output` does the same). Without it
