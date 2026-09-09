@@ -24,7 +24,11 @@ case "$OS" in
     install -m 0644 "$REPO_DIR/deploy/token-use.service" "$UNIT_DIR/token-use.service"
     echo "==> Enabling systemd user service"
     systemctl --user daemon-reload
-    systemctl --user enable --now token-use.service
+    systemctl --user enable token-use.service
+    # `restart` (not `enable --now`) so an upgrade actually loads the new
+    # binary — `start` on an already-active unit is a no-op and would leave
+    # the old process running.
+    systemctl --user restart token-use.service
     # Keep the service running even when no user session is logged in.
     loginctl enable-linger "$USER" 2>/dev/null || \
       echo "    (could not enable-linger; service runs while you are logged in)"

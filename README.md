@@ -125,6 +125,40 @@ TL;DR: add the flake input, `imports = [ inputs.token-use.homeModules.default ]`
 ```bash
 TOKEN_USE_OUT_DIR=./logs cargo run --release
 ```
+If a background service is already installed on this machine, also override
+`TOKEN_USE_STATE_DIR` (e.g. `TOKEN_USE_STATE_DIR=./state`) to a scratch
+directory. Otherwise this ad-hoc run shares the installed service's
+`state.json` checkpoint — it will advance byte offsets and Hermes ledger marks
+for records it only writes to your scratch `TOKEN_USE_OUT_DIR`, not to the
+service's real output dir, so the service's next tick can be starved of
+records it never gets to re-read. (The daemon caches its checkpoint in memory
+and only writes it back on a dirty tick, so a running service self-heals a
+clobbered `state.json` on its next tick — but don't rely on that window.)
+
+### Upgrading
+On each machine that runs the collector (repo already cloned, service already
+installed via `install.sh`):
+```bash
+git pull
+./install.sh
+```
+`install.sh` is idempotent and safe to re-run: it rebuilds the release binary,
+reinstalls it to `~/.local/bin/token-use`, and **restarts** the background
+service (systemd `restart` on Linux, launchd `bootout`+`bootstrap` on macOS)
+so the new binary actually takes effect — reinstalling the binary alone does
+not make an already-running process pick it up.
+
+The daemon's on-disk checkpoint (`state.json`) is untouched by an upgrade, so
+a restart resumes exactly where it left off — no backfill, no re-emitted
+records. Verify with `./status.sh` afterward.
+
+Only use `./reset.sh` if you deliberately want to wipe output + checkpoint and
+force a full backfill (e.g. recovering from a corrupted `state.json`) — it is
+not part of a normal upgrade.
+
+**NixOS (flakes):** there is no `install.sh` step — update the flake input
+(`nix flake update token-use` or per your pin) and `nixos-rebuild switch` (or
+`home-manager switch`). See [README-nix.md](README-nix.md).
 
 ### Check it's running
 ```bash
