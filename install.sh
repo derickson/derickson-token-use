@@ -41,9 +41,21 @@ case "$OS" in
     mkdir -p "$AGENT_DIR"
     sed "s|__HOME__|$HOME|g" "$REPO_DIR/deploy/com.derickson.token-use.plist" > "$PLIST"
     echo "==> Loading launchd agent"
-    launchctl bootout "gui/$(id -u)/com.derickson.token-use" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    launchctl enable "gui/$(id -u)/com.derickson.token-use"
+    DOMAIN="gui/$(id -u)"
+    launchctl bootout "$DOMAIN/com.derickson.token-use" 2>/dev/null || true
+    # `bootout` returns before launchd has necessarily finished tearing the
+    # old job down; an immediate `bootstrap` can then race it and fail with
+    # "Input/output error" (5). Poll briefly for the job to actually be gone.
+    for _ in $(seq 1 20); do
+      launchctl print "$DOMAIN/com.derickson.token-use" >/dev/null 2>&1 || break
+      sleep 0.25
+    done
+    if ! launchctl bootstrap "$DOMAIN" "$PLIST"; then
+      echo "    bootstrap failed, retrying once after a short delay..."
+      sleep 1
+      launchctl bootstrap "$DOMAIN" "$PLIST"
+    fi
+    launchctl enable "$DOMAIN/com.derickson.token-use"
     echo "==> Done. Logs: ~/Library/Logs/token-use.{out,err}.log"
     echo "    Output NDJSON: ~/Library/Application Support/token-use/logs/"
     ;;

@@ -16,7 +16,32 @@ mod tailer;
 use anyhow::Result;
 use tracing_subscriber::{fmt, EnvFilter};
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() -> Result<()> {
+    // A bare invocation (e.g. `token-use --version` as a sanity check) must
+    // never fall through to starting the daemon — that would run it against
+    // the real, already-running service's checkpoint and output dir. Handle
+    // these before anything else touches config/state.
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => {
+            println!("token-use {VERSION}");
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "token-use {VERSION}\n\
+                 Watches local AI-tool transcripts and emits per-call token-usage NDJSON.\n\n\
+                 Usage: token-use\n\n\
+                 Configuration is via environment variables (TOKEN_USE_OUT_DIR, \
+                 TOKEN_USE_STATE_DIR, ...) — see README.md. Running this binary with no \
+                 arguments starts the collector daemon in the foreground."
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+
     // Operational logging to stderr (journald/launchd capture it). This is the
     // daemon's own log — separate from the NDJSON token-usage output.
     fmt()
