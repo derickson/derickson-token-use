@@ -77,6 +77,28 @@ runs live. A ~5-minute tick rescans transcripts for missed events / new files,
 **polls the Hermes DBs**, and checkpoints state.
 
 ## Install (Linux & macOS)
+
+### Prerequisites: the Rust toolchain
+Building the collector needs `cargo`/`rustc` (Rust 2021, stable). The one-liner
+below works on both Linux and macOS; if `cargo` is already on your `PATH` you can
+skip it.
+
+```bash
+# Linux & macOS — official installer (installs rustup + the stable toolchain)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"      # add cargo to PATH for the current shell
+```
+
+Or use your package manager instead:
+- **macOS** — `brew install rustup-init && rustup-init` (or `brew install rust`).
+- **Linux (Debian/Ubuntu)** — `sudo apt install rustup && rustup default stable`
+  (older releases: `sudo apt install cargo`); **Fedora** — `sudo dnf install cargo`;
+  **Arch** — `sudo pacman -S rust`.
+
+Verify with `cargo --version`. On macOS the build also needs the Command Line
+Tools (`xcode-select --install`) for the system linker.
+
+### Build + register the service
 ```bash
 ./install.sh
 ```
@@ -90,10 +112,30 @@ Output NDJSON lands in:
 - Linux: `~/.local/share/token-use/logs/`
 - macOS: `~/Library/Application Support/token-use/logs/`
 
+### NixOS (flakes)
+**NixOS users: don't run `install.sh`.** This repo is a flake that builds the
+collector reproducibly and ships a home-manager module (plus a system-level
+module) that registers the same systemd **user** service declaratively. Full
+instructions — inputs, options, and management — are in **[README-nix.md](README-nix.md)**.
+
+TL;DR: add the flake input, `imports = [ inputs.token-use.homeModules.default ]`,
+`services.token-use.enable = true;`, and `nixos-rebuild switch`.
+
 ### Run manually
 ```bash
 TOKEN_USE_OUT_DIR=./logs cargo run --release
 ```
+
+### Check it's running
+```bash
+./status.sh
+```
+`status.sh` auto-detects macOS vs Linux and reports the health of the whole
+pipeline: the collector daemon (process + launchd/systemd registration), the
+freshness of the output NDJSON, and which shipper — a Fleet-managed Elastic
+Agent and/or the standalone Filebeat below — is picking the logs up. It changes
+nothing and exits non-zero if the collector or all shippers are down (handy for
+`&&` chaining or monitoring).
 
 ## Configuration (environment)
 | Var | Default | Purpose |
@@ -108,9 +150,96 @@ TOKEN_USE_OUT_DIR=./logs cargo run --release
 | `RUST_LOG` | `info` | operational log level (stderr) |
 
 ## Elasticsearch ingestion
-See [`deploy/filebeat-token-use.yml`](deploy/filebeat-token-use.yml) for a
-filestream input. Recommended: an ingest pipeline that sets `_id` to
-`claude.message_id` for call records, making re-ingestion idempotent.
+On Fleet-managed machines, an Elastic Agent custom-logs integration tails the
+NDJSON output and ships it. The records carry `event.dataset`
+(`claude_code.token_usage` / `claude_code.turn`) and `event.module: token-use`, and
+belong in per-dataset data streams `logs-<event.dataset>-<namespace>`.
+See [`deploy/filebeat-token-use.example.yml`](deploy/filebeat-token-use.example.yml)
+for the standalone shipper, which routes there directly (see
+[Data stream routing](#data-stream-routing)).
+
+### Un-Fleet-managed Macs: standalone Filebeat
+For Macs that **cannot be enrolled in Fleet**, `mac-filebeat-install.sh` ships the
+same logs to the same Elastic cluster with the **same NDJSON preprocessing**, using
+a self-contained Filebeat that lives in this project directory and is driven by a
+local yml.
+
+```bash
+./mac-filebeat-install.sh        # 1st run: downloads Filebeat, creates local config, stops
+#   edit ./filebeat-token-use.yml  (set the Elasticsearch host + API key; routing pre-filled)
+./mac-filebeat-install.sh        # 2nd run: validates, registers launchd service
+./mac-filebeat-install.sh --uninstall   # stop + remove the service
+./mac-reprocess.sh               # reset the registry + re-ship every *.ndjson
+```
+
+Use `mac-reprocess.sh` after an ingest-pipeline / data-stream fix to re-ingest
+records that were already shipped (it clears the Filebeat registry so every line
+is re-read). It is the shipper-side counterpart to `reset.sh` (which re-backfills
+the collector). Because data-stream docs get an auto-assigned `_id`, a re-ship can
+duplicate records that were *already* ingested successfully — run it when the
+prior attempts failed (e.g. failure store) or you want a deliberate full re-ingest.
+
+What it does:
+- Downloads a pinned Filebeat (**9.4.2**, matching the Fleet agent and the 9.x
+  stack) into `./filebeat/` (gitignored).
+- Creates `./filebeat-token-use.yml` (gitignored, `chmod 0600`) from
+  [`deploy/filebeat-token-use.example.yml`](deploy/filebeat-token-use.example.yml).
+- Registers a **launchd agent** (`com.derickson.token-use-filebeat`, `RunAtLoad` +
+  `KeepAlive`) so Filebeat runs at boot without a login.
+
+The example carries the routing/parsing taken from a Fleet-managed host's
+`elastic-agent inspect`:
+- same NDJSON parser (`target: ""`, `overwrite_keys`, `add_error_key`),
+- direct routing to `logs-<event.dataset>-dericksontokenuse`
+  (see [Data stream routing](#data-stream-routing)).
+
+You supply **two** values, both kept out of git (the committed example has only
+`__ES_HOST__` / `__ID__:__API_KEY__` placeholders):
+
+1. **The Elasticsearch host** (`output.elasticsearch.hosts`) — your Elastic Cloud
+   deployment endpoint, form `https://<deployment-id>.<region>.<csp>.elastic.cloud:443`.
+   Read it from your Fleet agent's `elastic-agent inspect` (the
+   `output.elasticsearch.hosts` value) or copy it from the Elastic Cloud console.
+2. **A dedicated API key** (do *not* reuse the Fleet agent's key). In Kibana →
+   *Stack Management → API keys*, create one whose role descriptor allows writing
+   the token-use data streams, e.g.:
+
+```json
+{ "token-use-filebeat": {
+  "cluster": ["monitor"],
+  "indices": [ {
+    "names": ["logs-claude_code.*-dericksontokenuse"],
+    "privileges": ["auto_configure", "create_doc"] } ] } }
+```
+
+The `cluster: ["monitor"]` privilege is required: Filebeat calls `GET /` for a
+version check at startup (and `filebeat test output` does the same). Without it
+you get `403 ... action [cluster:monitor/main] is unauthorized`. The `indices`
+block alone is enough to *write* data but not to pass that check.
+
+Paste the host and the key (in `id:key` form) into `filebeat-token-use.yml`, then
+re-run `./mac-filebeat-install.sh`.
+
+### Data stream routing
+The shipper writes each record straight to its final data stream by
+`event.dataset` — `output.elasticsearch.index: "logs-%{[event.dataset]}-dericksontokenuse"`
+— so `claude_code.turn` → `logs-claude_code.turn-dericksontokenuse`, etc. These are
+auto-created by the stock `logs-*-*` template (permissive mappings), so
+`event.module: token-use` is accepted.
+
+This **bypasses** the `filestream.generic` data stream on purpose: that's the
+Custom Logs package stream, and its mapping pins `event.module` to the constant
+`filestream`, so any record written there with `event.module: token-use` is
+rejected (`document_parsing_exception`) and dead-letters into the
+`.fs-…` failure store. A Fleet *custom-logs* integration that writes to
+`filestream.generic` hits the same wall and needs either a `reroute` ingest
+pipeline (`{ "reroute": { "dataset": "{{{event.dataset}}}" } }`) or a dedicated
+dataset — the standalone shipper just routes correctly to begin with.
+
+> **No idempotent `_id`.** Data streams reject a client- or pipeline-set `_id`, so
+> re-ingestion is **not** deduped by `message.id`. Each line is shipped once
+> (collector checkpoint + Filebeat registry); duplicates only occur if the registry
+> is reset (e.g. `mac-reprocess.sh`) and the same lines are re-read.
 
 ## Development
 ```bash
@@ -130,6 +259,13 @@ src/
     hermes.rs          Hermes collector (SQLite poll source)
   daemon.rs            backfill + watch loop + tick (+ poll sources)
   config.rs main.rs error.rs
-deploy/                systemd unit, launchd plist, filebeat example
-install.sh             build + install the service (Linux/macOS)
+deploy/                systemd unit, launchd plists, standalone filebeat example
+flake.nix              Nix flake: package + home-manager/NixOS modules
+nix/                   the module implementations (see README-nix.md)
+install.sh             build + install the collector service (Linux/macOS)
+status.sh              health check: collector + shipper (Linux/macOS)
+reset.sh               stop, wipe output + checkpoint, restart (full backfill)
+mac-filebeat-install.sh  standalone Filebeat shipper for un-Fleet-able Macs
+mac-reprocess.sh         reset the Filebeat registry + re-ship all NDJSON
+README-nix.md            NixOS install guide (flake input + modules)
 ```
