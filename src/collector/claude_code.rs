@@ -106,7 +106,7 @@ impl ClaudeCodeCollector {
                 name: SERVICE,
                 version: call.version.clone(),
             },
-            provider: PROVIDER,
+            provider: PROVIDER.to_string(),
             model: call.model.clone(),
             host: Host {
                 name: self.host.clone(),
@@ -124,6 +124,7 @@ impl ClaudeCodeCollector {
                 entrypoint: call.entrypoint,
             }),
             codex: None,
+            opencode: None,
             tokens: Tokens {
                 input: u.input,
                 output: u.output,

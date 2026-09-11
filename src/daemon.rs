@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 use crate::collector::claude_code::ClaudeCodeCollector;
 use crate::collector::codex::CodexCollector;
 use crate::collector::hermes::HermesCollector;
+use crate::collector::opencode::OpencodeCollector;
 use crate::collector::{Collector, PollCollector};
 use crate::config::Config;
 use crate::output::OutputWriter;
@@ -44,8 +45,14 @@ impl Daemon {
             Box::new(ClaudeCodeCollector::new(&config.home, host.clone())),
             Box::new(CodexCollector::new(&config.codex_dir, host.clone())),
         ];
-        let poll_collectors: Vec<Box<dyn PollCollector>> =
-            vec![Box::new(HermesCollector::new(&config.hermes_dir, host, config.hermes_idle))];
+        let poll_collectors: Vec<Box<dyn PollCollector>> = vec![
+            Box::new(HermesCollector::new(
+                &config.hermes_dir,
+                host.clone(),
+                config.hermes_idle,
+            )),
+            Box::new(OpencodeCollector::new(&config.opencode_dir, host)),
+        ];
 
         let mut writers = HashMap::new();
         for c in &collectors {

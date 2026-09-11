@@ -15,6 +15,7 @@ use crate::state::State;
 pub mod claude_code;
 pub mod codex;
 pub mod hermes;
+pub mod opencode;
 
 pub trait Collector: Send {
     /// `service.name` for emitted records, e.g. `"claude-code"`.

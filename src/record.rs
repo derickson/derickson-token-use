@@ -49,9 +49,10 @@ impl OutputRecord {
     /// the per-DB cursor already gates re-emits and ES upserts by `_id`.
     pub fn dedup_key(&self) -> Option<&str> {
         match self {
-            OutputRecord::Call(c) => match (&c.claude, &c.codex) {
-                (Some(m), _) => Some(&m.message_id),
-                (_, Some(m)) => Some(&m.response_id),
+            OutputRecord::Call(c) => match (&c.claude, &c.codex, &c.opencode) {
+                (Some(m), _, _) => Some(&m.message_id),
+                (_, Some(m), _) => Some(&m.response_id),
+                (_, _, Some(m)) => Some(&m.message_id),
                 _ => None,
             },
             OutputRecord::Turn(_) => None,
@@ -90,15 +91,21 @@ pub struct CallRecord {
     pub ingested_at: String,
     pub event: Event,
     pub service: Service,
-    pub provider: &'static str,
+    /// Owned rather than `&'static str` because a single service can front many
+    /// providers: opencode routes per message (`anthropic`, `openai`, a local
+    /// `lmstudio`, ...), so the value is only known at record-build time.
+    pub provider: String,
     pub model: String,
     pub host: Host,
-    /// Provider-specific metadata: exactly one of `claude`/`codex` is set, named
-    /// per source so a new collector never reshapes an existing one's fields.
+    /// Provider-specific metadata: exactly one of `claude`/`codex`/`opencode` is
+    /// set, named per source so a new collector never reshapes an existing one's
+    /// fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude: Option<ClaudeMeta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex: Option<CodexMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<OpencodeMeta>,
     pub tokens: Tokens,
     /// Per-call inference throughput, when the source records enough timing to
     /// derive it. Absent for providers whose transcripts carry a single
@@ -159,6 +166,41 @@ pub struct CodexMeta {
     /// first-order driver of `tokens.reasoning`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+}
+
+/// opencode per-call metadata, from one assistant row of the `message` table.
+///
+/// `project` holds the message's `path.cwd`, deliberately the same field name
+/// and meaning as [`ClaudeMeta::project`] and [`CodexMeta::project`], so a Kibana
+/// view can group by project across every service.
+///
+/// opencode writes **one assistant message per API call** (a tool loop produces
+/// several messages, not several steps inside one), so `message_id` is the
+/// per-call idempotency key — the direct analogue of Claude's `message.id` and
+/// Codex's `response_id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpencodeMeta {
+    pub message_id: String,
+    /// Duplicate of the top-level `model` kept for provider-specific fidelity.
+    pub model: String,
+    pub session_id: String,
+    pub project: String,
+    /// Session title, useful for identifying a run in Kibana.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_title: Option<String>,
+    /// The opencode agent/mode that produced the call, e.g. `"build"`/`"plan"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// `finish` reason reported by the provider, e.g. `"stop"`/`"tool-calls"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// True when the message belongs to a child session (`session.parent_id` is
+    /// set) — opencode's sub-agent analogue of Claude Code's `is_sidechain`.
+    pub is_sidechain: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Which database channel the row came from, e.g. `"stable"`.
+    pub channel: String,
 }
 
 /// Token breakdown. Prompt side = `input + cache_read_input + cache_creation_input`

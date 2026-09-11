@@ -21,6 +21,9 @@ pub struct Config {
     pub codex_dir: PathBuf,
     /// Root of the Hermes install (the SQLite poll source), normally `~/.hermes`.
     pub hermes_dir: PathBuf,
+    /// opencode's data directory, normally `~/.local/share/opencode`; it holds
+    /// the `opencode-<channel>.db` SQLite databases.
+    pub opencode_dir: PathBuf,
     /// A Hermes session is finalized and emitted **once** after it has been idle
     /// (no new message) for this long, unless it has already ended. Keeps a
     /// growing session from being written before its totals settle.
@@ -40,6 +43,8 @@ impl Config {
     ///   * `TOKEN_USE_HOME`      — home override (default: `$HOME`)
     ///   * `TOKEN_USE_CODEX_DIR`  — Codex install dir (default: `$HOME/.codex`)
     ///   * `TOKEN_USE_HERMES_DIR` — Hermes install dir (default: `$HOME/.hermes`)
+    ///   * `TOKEN_USE_OPENCODE_DIR` — opencode data dir
+    ///     (default: `$XDG_DATA_HOME/opencode`, else `$HOME/.local/share/opencode`)
     ///   * `TOKEN_USE_HERMES_IDLE_SECS` — settle window before a session is
     ///     emitted once (default 600)
     ///   * `TOKEN_USE_DEBOUNCE_MS` (default 1500)
@@ -57,6 +62,19 @@ impl Config {
         let hermes_dir = std::env::var_os("TOKEN_USE_HERMES_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".hermes"));
+
+        // opencode follows the XDG data spec on both Linux and macOS (it does
+        // *not* use ~/Library/Application Support), so honour XDG_DATA_HOME first
+        // and fall back to the spec's own default rather than `dirs::data_dir()`.
+        let opencode_dir = std::env::var_os("TOKEN_USE_OPENCODE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_absolute())
+                    .unwrap_or_else(|| home.join(".local").join("share"))
+                    .join("opencode")
+            });
 
         let hermes_idle = env_u64("TOKEN_USE_HERMES_IDLE_SECS")
             .map(Duration::from_secs)
@@ -89,6 +107,7 @@ impl Config {
             home,
             codex_dir,
             hermes_dir,
+            opencode_dir,
             hermes_idle,
             debounce,
             tick,

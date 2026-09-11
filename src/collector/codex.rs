@@ -245,7 +245,7 @@ impl CodexCollector {
                 name: SERVICE,
                 version: s.cli_version.clone(),
             },
-            provider: PROVIDER,
+            provider: PROVIDER.to_string(),
             model: model.clone(),
             host: Host { name: host },
             claude: None,
@@ -261,6 +261,7 @@ impl CodexCollector {
                 originator: s.originator.clone(),
                 reasoning_effort,
             }),
+            opencode: None,
             tokens: u.to_tokens(),
             perf: None,
             tools: Tools {

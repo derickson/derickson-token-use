@@ -5,11 +5,12 @@ high-fidelity, **per-API-call** token-usage log in NDJSON — ready for an
 Elasticsearch **filestream / Filebeat** integration to pick up.
 
 It exists to close the gap Elastic's cloud integrations leave: token spend from
-API calls made on **your own laptops and servers**. It ships with three
+API calls made on **your own laptops and servers**. It ships with four
 integrations — **Anthropic Claude Code** (tailing `~/.claude` transcripts),
-**OpenAI Codex CLI** (tailing `~/.codex` rollout logs), and the **Hermes AI
-agent** (polling its `~/.hermes` SQLite state) — and the collector layer is
-pluggable so Ollama and others can be added later.
+**OpenAI Codex CLI** (tailing `~/.codex` rollout logs), **opencode** (polling its
+`~/.local/share/opencode` SQLite state), and the **Hermes AI agent** (polling its
+`~/.hermes` SQLite state) — and the collector layer is pluggable so Ollama and
+others can be added later.
 
 Every record identifies the **provider**, **model**, **service**, **host**, and
 **project**, with a full prompt-vs-response token breakdown and derived
@@ -28,7 +29,37 @@ so one Kibana view can slice every source.
 | `claude_code.turn` | agent turn (`turn_duration`) | `turn.duration_ms`, summed `output_tokens`, effective `tokens_per_sec` |
 | `codex.token_usage` | API call (`response_id`) | prompt/response tokens, cached + cache-write breakdown, `tokens.reasoning`, `tools.use_count`/`names`, `codex.model` (per turn), `reasoning_effort` |
 | `codex.turn` | agent turn (`task_complete`) | `turn.duration_ms`, Codex's own turn `output_tokens`, effective `tokens_per_sec`, `codex.time_to_first_token_ms` |
+| `opencode.token_usage` | API call (`message.id`) | prompt/response tokens, cache read/write breakdown, `tokens.reasoning`, `perf.tokens_per_sec` + `generation_ms`, `tools.use_count`/`names`, per-message `provider` (`anthropic`/`openai`/`lmstudio`/…), `opencode.agent`, `session_title`, `channel` |
 | `hermes.token_usage` | Hermes session | per-session `input`/`output`/`cache_read`/`cache_creation(=cache write)`/`reasoning` tokens, `provider` (`billing_provider`, e.g. `openai-codex`), `model` (e.g. `gpt-5.5`), `hermes.persona`, `source`, cost + `duration_ms` |
+
+### opencode specifics
+opencode keeps everything in **SQLite** (`~/.local/share/opencode/opencode-<channel>.db`),
+so it's a **poll source** like Hermes — but unlike Hermes it is *call*-grained:
+each `message` row holds one API response's complete usage, so the grain is **one
+record per call**, directly comparable with Claude Code and Codex. It's also the
+only source besides Claude Code that records a response's start *and* completion,
+so `perf.generation_ms` / `tokens_per_sec` are real rather than omitted.
+
+Two mapping decisions are worth knowing:
+
+- **Only the `message` table is read.** The `part` table also carries
+  `step-finish` rows with a full `tokens` block; reading both would double-count.
+  opencode writes one assistant message per API call (a tool loop appends further
+  messages, not extra steps), and its own running `session` totals equal the sum
+  of the per-message tokens exactly — an invariant asserted against a real
+  database by the `reconciles_with_session_aggregates` test.
+- **`output` includes reasoning.** opencode reports `reasoning` *outside*
+  `output`, unlike Claude Code (thinking counts inside `output`) and OpenAI
+  (`completion_tokens` includes `reasoning_tokens`). We emit
+  `output + reasoning` and keep `tokens.reasoning` as the breakdown, so
+  reasoning-heavy models don't read as near-zero output next to other services.
+
+A call is emitted once its `time.completed` is set; in-flight calls are left
+alone, and aborted ones (zero tokens) are skipped rather than emitted as zeroes.
+`provider` is per **message**, not per service — opencode routes to Anthropic,
+OpenAI, or a local runtime like `lmstudio` from one session. Every
+`opencode-<channel>.db` is picked up, so a dev channel alongside stable is
+tracked separately.
 
 ### Hermes specifics
 Hermes stores state in **SQLite** (`~/.hermes/state.db` plus one
@@ -109,7 +140,8 @@ captured.
 
 ## How it works
 There are two collector seams: a line-tailed **`Collector`** (Claude Code, Codex)
-and a **`PollCollector`** for sources that don't fit byte-tailing (Hermes/SQLite).
+and a **`PollCollector`** for sources that don't fit byte-tailing (opencode,
+Hermes — both SQLite).
 
 **Claude Code (tail):**
 - Watches `~/.claude/projects` with a debounced filesystem watcher (`notify`).
@@ -132,6 +164,19 @@ and a **`PollCollector`** for sources that don't fit byte-tailing (Hermes/SQLite
   with a fabricated zero (verified against real rollouts: emitted call count ==
   `token_usage_record` line count).
 
+**opencode (poll):**
+- Each `opencode-<channel>.db` is opened **read-only** (and never `immutable`,
+  which would skip opencode's large WAL and read a stale snapshot).
+- A poll walks `message` rows from a **watermark** over `time_created` and emits
+  every settled, not-yet-emitted call, recording each `message.id` in the durable
+  **ledger** so it is never written twice.
+- The watermark advances only to the **oldest still-unsettled** call, never past
+  it, so a call in flight during one poll cannot be stranded when it completes.
+- It starts at **0**, so a fresh checkpoint replays the **entire** history — see
+  *Backfilling all history* below.
+- Marks below the watermark can never be rescanned, so the ledger is pruned to
+  the rescan window; a per-call ledger would otherwise grow without bound.
+
 **Hermes (poll):**
 - Each persona DB is opened **read-only**; a poll scans sessions and emits each
   **settled, not-yet-emitted** session exactly once, recording its id in a durable
@@ -141,9 +186,58 @@ and a **`PollCollector`** for sources that don't fit byte-tailing (Hermes/SQLite
   cursor — is what guarantees once-only emission (verified: a settled session emits
   once; growth, re-polls, and restarts add zero further lines).
 
-On first run it **backfills** all existing transcripts and Hermes sessions, then
-runs live. A ~5-minute tick rescans transcripts for missed events / new files,
-**polls the Hermes DBs**, and checkpoints state.
+On first run it **backfills** all existing transcripts, opencode calls, and
+Hermes sessions, then runs live. A ~5-minute tick rescans transcripts for missed
+events / new files, **polls the SQLite sources**, and checkpoints state.
+
+### Backfilling all history
+Both poll sources derive "what's already been sent" purely from `state.json`, so
+**history is bounded only by the checkpoint, never by the clock**. Nothing
+recency-gates a scan.
+
+**Adding a new collector needs no reset.** Cursors and ledger marks are
+namespaced *per source* (per database for the poll collectors, per file for the
+tailers), so an existing `state.json` written by the other collectors reads as
+"never scanned" for the new one. Install the new binary, restart the service, and
+its first poll emits that source's entire history — routed to the correct daily
+file by record timestamp — while every other collector resumes exactly where it
+left off. Asserted by
+`adding_the_collector_to_an_existing_checkpoint_still_backfills`.
+
+> **Do not use `reset.sh` to backfill a new collector.** It is a whole-system
+> do-over: it deletes **every** service's NDJSON *and* the entire `state.json`
+> (all byte offsets and all ledger marks), not just the source you care about.
+> See the warning below before ever running it.
+
+#### ⚠️ `reset.sh` can destroy history permanently
+A reset assumes the NDJSON can be rebuilt from the source transcripts. **That
+assumption expires.** Claude Code prunes its own transcripts on a retention
+window (`cleanupPeriodDays`, 30 days by default), so any record whose transcript
+has since been pruned exists **only** in the NDJSON that `reset.sh` deletes, and
+is unrecoverable.
+
+This is not hypothetical — check before you run it:
+
+```bash
+OUT=~/Library/Application\ Support/token-use/logs   # Linux: ~/.local/share/token-use/logs
+# Oldest surviving Claude Code transcript:
+find ~/.claude/projects -name '*.jsonl' -exec stat -f '%Sm' -t '%Y-%m-%d' {} \; | sort | head -1
+# Oldest day the NDJSON covers:
+ls "$OUT"/claude-code-*.ndjson | sed 's|.*claude-code-||;s|\.ndjson||' | sort | head -1
+```
+
+If the NDJSON reaches further back than the oldest transcript, everything in that
+gap is lost the moment you reset. Copy `$OUT` somewhere safe first.
+
+Reset is the right tool for one job only: the collector's *output* is wrong (a
+mapping bug) and must be regenerated. If the NDJSON on disk is already correct
+and you only need Elasticsearch to ingest it again, use `mac-reprocess.sh`, which
+re-ships the existing files without deleting anything.
+
+Either way, a replay re-emits lines already shipped: point Filebeat at a fresh
+output directory (or clear the shipper's registry) if you are backfilling into an
+index that already holds them — a data stream assigns its own `_id` and cannot
+upsert, so duplicate lines would land as duplicate documents.
 
 ## Install (Linux & macOS)
 
@@ -197,7 +291,8 @@ TOKEN_USE_OUT_DIR=./logs cargo run --release
 If a background service is already installed on this machine, also override
 `TOKEN_USE_STATE_DIR` (e.g. `TOKEN_USE_STATE_DIR=./state`) to a scratch
 directory. Otherwise this ad-hoc run shares the installed service's
-`state.json` checkpoint — it will advance byte offsets and Hermes ledger marks
+`state.json` checkpoint — it will advance byte offsets, poll-source cursors, and
+opencode/Hermes ledger marks
 for records it only writes to your scratch `TOKEN_USE_OUT_DIR`, not to the
 service's real output dir, so the service's next tick can be starved of
 records it never gets to re-read. (The daemon caches its checkpoint in memory
@@ -247,6 +342,7 @@ nothing and exits non-zero if the collector or all shippers are down (handy for
 | `TOKEN_USE_STATE_DIR` | XDG state / App Support | checkpoint (`state.json`) |
 | `TOKEN_USE_HOME` | `$HOME` | locate `~/.claude` (handy for testing) |
 | `TOKEN_USE_CODEX_DIR` | `$HOME/.codex` | Codex CLI install dir (its `sessions/` holds the rollout logs) |
+| `TOKEN_USE_OPENCODE_DIR` | `$XDG_DATA_HOME/opencode`, else `$HOME/.local/share/opencode` | opencode data dir holding `opencode-<channel>.db` |
 | `TOKEN_USE_HERMES_DIR` | `$HOME/.hermes` | Hermes install dir (the SQLite poll source) |
 | `TOKEN_USE_HERMES_IDLE_SECS` | `600` | idle window before a Hermes session is finalized + emitted once |
 | `TOKEN_USE_DEBOUNCE_MS` | `1500` | FS-event debounce window |
@@ -377,6 +473,7 @@ src/
     mod.rs             Collector + PollCollector traits (the per-service seams)
     claude_code.rs     Anthropic Claude Code collector (line tailer)
     codex.rs           OpenAI Codex CLI collector (rollout JSONL tail)
+    opencode.rs        opencode collector (SQLite poll source, call-grained)
     hermes.rs          Hermes collector (SQLite poll source)
   daemon.rs            backfill + watch loop + tick (+ poll sources)
   config.rs main.rs error.rs

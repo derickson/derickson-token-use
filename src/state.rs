@@ -131,6 +131,25 @@ impl State {
         }
     }
 
+    /// Drop every mark in `ns` that is not in `keep`.
+    ///
+    /// A once-only ledger is unbounded by design, which is right when its ids are
+    /// coarse (Hermes marks one id per *session*). A collector that marks one id
+    /// per *API call* would instead grow the checkpoint without limit, so it can
+    /// prune: once its cursor has advanced past a record, that id can never be
+    /// rescanned and the mark is dead weight. Pruning is therefore safe only for
+    /// ids the caller has proven unreachable — `keep` must contain everything
+    /// still within the rescan window.
+    pub fn retain_marks(&mut self, ns: &str, keep: &HashSet<String>) {
+        if let Some(set) = self.marks.get_mut(ns) {
+            let before = set.len();
+            set.retain(|id| keep.contains(id));
+            if set.len() != before {
+                self.dirty = true;
+            }
+        }
+    }
+
     /// Atomically persist if there are unsaved changes (temp file + rename).
     pub fn save_if_dirty(&mut self) -> Result<(), StateError> {
         if !self.dirty {

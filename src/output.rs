@@ -64,7 +64,7 @@ mod tests {
             ingested_at: ts.into(),
             event: Event { dataset: "claude_code.token_usage", module: "token-use" },
             service: Service { name: "claude-code", version: None },
-            provider: "anthropic",
+            provider: "anthropic".to_string(),
             model: "claude-opus-4-8".into(),
             host: Host { name: "h".into() },
             claude: Some(ClaudeMeta {
@@ -80,6 +80,7 @@ mod tests {
                 entrypoint: None,
             }),
             codex: None,
+            opencode: None,
             tokens: Tokens {
                 input: 1, output: 2, cache_read_input: 0, cache_creation_input: 0,
                 cache_creation_ephemeral_5m_input: 0, cache_creation_ephemeral_1h_input: 0,
